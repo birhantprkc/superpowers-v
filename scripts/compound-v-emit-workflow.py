@@ -1858,6 +1858,24 @@ def _provision_spec(manifest, job):
     return command, timeout
 
 
+def _toolchain_artifacts_spec(manifest):
+    """The manifest's top-level `toolchain_artifacts` globs, or `[]` (issue #22).
+
+    MANIFEST-LEVEL ONLY, same reasoning as `_provision_spec`: `toolchain_artifacts`
+    is a run-wide declaration, not a per-job one, so there is no job-level
+    override to read. `compound-v-validate-manifest.py` is where a malformed
+    value is REFUSED — a bare string, a catch-all glob, a non-string entry; this
+    function only decides what the emitter passes through, and it fails closed
+    into "nothing declared" rather than trying to salvage a partially-valid list,
+    which would make the emitter's idea of the manifest disagree with the
+    validator's.
+    """
+    raw = (manifest or {}).get("toolchain_artifacts") if isinstance(manifest, dict) else None
+    if isinstance(raw, list) and raw and all(isinstance(g, str) and g.strip() for g in raw):
+        return list(raw)
+    return []
+
+
 def build_launch_argv(job, entry, run_id, repo_root, run_dir, model):
     """The COMPLETE worker argv — every flag the worker script requires."""
     argv = [
@@ -1904,6 +1922,13 @@ def build_launch_argv(job, entry, run_id, repo_root, run_dir, model):
         argv += ["--provision-command", entry["provision_command"],
                  "--provision-timeout-sec",
                  str(entry.get("provision_timeout_s") or PROVISION_TIMEOUT_DEFAULT)]
+    # `toolchain_artifacts` (issue #22): a MANIFEST-level list, not a per-job one
+    # (same reasoning as `provision_command` above), passed through to the
+    # external worker's own scope-check invocation unchanged — one repeatable
+    # `--toolchain-artifact <glob>` flag per glob, none when the manifest
+    # declares none.
+    for _glob in (entry.get("toolchain_artifacts") or []):
+        argv += ["--toolchain-artifact", _glob]
     return argv
 
 
@@ -2243,6 +2268,11 @@ def build_plan(manifest, run_dir, repo_root, python_bin, self_path,
             # the timeout to size its own Bash call.
             "provision_command": _provision_spec(manifest, job)[0],
             "provision_timeout_s": _provision_spec(manifest, job)[1],
+            # `toolchain_artifacts` (issue #22): MANIFEST-level only, same reasoning
+            # as `provision_command` above — resolved here, where the manifest is
+            # still in hand, so `build_launch_argv` (handed the entry, not the
+            # manifest) can pass it straight through to the external worker.
+            "toolchain_artifacts": _toolchain_artifacts_spec(manifest),
             "write_allowed": job.get("write_allowed") or [],
             "read_allowed": job.get("read_allowed") or [],
             # v3.4.17: this task's `**Interfaces:**` block from the plan — the
@@ -3854,7 +3884,7 @@ def _preexisting_snapshot(root, python_bin):
 
 
 def _run_scope_check(scope_check, mode, root, baseline, allow, python_bin,
-                     preexisting=None):
+                     preexisting=None, toolchain_artifacts=None):
     cmd = [python_bin, "-B", scope_check]
     cmd += ["--worktree" if mode == "worktree" else "--repo", root]
     if baseline:
@@ -3868,6 +3898,10 @@ def _run_scope_check(scope_check, mode, root, baseline, allow, python_bin,
     # captured correctly.
     if preexisting:
         cmd += ["--preexisting", preexisting]
+    # `toolchain_artifacts` (issue #22): repeatable, one `--toolchain-artifact
+    # <glob>` per manifest-declared glob, none when the manifest declares none.
+    for glob in (toolchain_artifacts or []):
+        cmd += ["--toolchain-artifact", glob]
     rc, out, err = _run(cmd)
     try:
         parsed = json.loads(out) if out.strip() else None
@@ -4009,6 +4043,11 @@ def cmd_gate_receipt(argv):
         print(json.dumps(out, indent=2, sort_keys=True))
         return 2
 
+    # `toolchain_artifacts` (issue #22): the manifest's declared exemption for
+    # build artifacts the test floor writes on first run. MANIFEST-level only —
+    # resolved once, here, and threaded through to the scope check below.
+    manifest_toolchain_artifacts = _toolchain_artifacts_spec(manifest)
+
     repo_root = os.path.abspath(args.repo_root)
     reasons = []
 
@@ -4136,8 +4175,15 @@ def cmd_gate_receipt(argv):
         _atomic_write(verified, "\n".join(kept) + ("\n" if kept else ""))
         pre = verified
     rc, raw_stdout, err, parsed = _run_scope_check(
-        args.scope_check, args.mode, root, baseline, allow, args.python, preexisting=pre
+        args.scope_check, args.mode, root, baseline, allow, args.python, preexisting=pre,
+        toolchain_artifacts=manifest_toolchain_artifacts,
     )
+    # What the gate forgave under `toolchain_artifacts`, distinct from `changed`
+    # and `violations` — recorded even on a `blocked`/`error` verdict, and `[]`
+    # rather than absent when the manifest declared none or the gate produced no
+    # JSON, so a reader never has to distinguish "declared nothing" from "gate
+    # didn't run" by checking for the key's existence.
+    out["toolchain_artifacts"] = (parsed or {}).get("toolchain_artifacts") or []
     # NAME THE OPERATOR'S FOOTPRINTS SEPARATELY.
     #
     # A `direct`-mode job measures the whole tree, so ANYTHING written while
@@ -5986,6 +6032,99 @@ def cmd_finalize_wave(argv):
 
 
 # --------------------------------------------------------------------------- #
+# re-attempt detection and supersession (v3.6.3)
+#
+# `register-lane` pinned `jobs/<id>.baseline` ONCE and, before this, never
+# rewrote it — only `resume-prepare` (called by `/v:resume`) cleared it. That
+# left a door `/v:resume` does not guard: a human re-running `/v:dispatch` on a
+# halted run directory gets a fresh worktree branched from the CURRENT HEAD, but
+# the gate still diffs against the FIRST attempt's pin, so every bookkeeping
+# commit the pipeline made between attempts (`manifest.yaml`,
+# `dispatch.workflow.js`, `state.json`, `results/<id>.json`,
+# `preexisting/<id>.txt`) is charged to the job as an out-of-lane write — finding
+# 146 (2026-09-03), reached through the un-guarded door.
+# --------------------------------------------------------------------------- #
+def _prior_attempt_concluded(run_dir, job_id, state_entry):
+    """True iff a PREVIOUS attempt at `job_id` reached a pipeline-written
+    conclusion and was never integrated.
+
+    "Concluded" means a gate receipt (`receipts/<id>.gate.json`) or a Record
+    result (`results/<id>.json`) already exists on disk — both are written by
+    the PIPELINE (the gate / Record), never by the worker, which is why this is
+    a signal `register-lane` can trust without asking the worker anything — for
+    a WORKTREE job. Its lane is the worktree; the run directory lives in the
+    checkout, outside every worktree lane, and even a worker that reached it
+    would gain nothing from a re-pin: the gate diffs the sealed patch against
+    the new pin, so a commit hidden behind it never merges. A DIRECT worker can
+    write anywhere in the checkout, including a forged `results/<id>.json`,
+    which is why the caller only ever re-pins in worktree mode and merely
+    warns in direct mode.
+
+    `merged.integrated: true` vetoes it — an integrated job's registration is
+    not a re-attempt at anything; there is nothing left to supersede.
+    """
+    merged = (state_entry or {}).get("merged") or {}
+    if isinstance(merged, dict) and merged.get("integrated"):
+        return False
+    receipt = os.path.join(run_dir, "receipts", "%s.gate.json" % job_id)
+    result = os.path.join(run_dir, "results", "%s.json" % job_id)
+    return os.path.exists(receipt) or os.path.exists(result)
+
+
+def _supersede_attempt(run_dir, job_id, entry, wts, keep_cwd=None):
+    """Retire a concluded attempt at `job_id`: unpin its baseline, reset it to
+    `pending`, drop its lane-map worktree entries, and archive its gate receipt
+    so the integration authority never reads a superseded attempt's verdict as
+    the current one's.
+
+    Factored out of `cmd_resume_prepare`, which was the only caller until
+    `cmd_register_lane` gained its own re-attempt door (v3.6.3) — the archive
+    tag/collision logic is moved here verbatim, not duplicated.
+
+    Mutates `entry` (a `state["jobs"][job_id]` dict) and `wts` (a
+    `lane-map.json` `"worktrees"` mapping, or `None`) IN PLACE; the caller is
+    responsible for saving both under its own `_run_dir_lock`. `keep_cwd`, when
+    given, is a worktree path this call must NOT drop from `wts` even if it is
+    currently mapped to `job_id` — used when the caller is about to register
+    that exact path itself, so a lane-map cleanup pass here can't undo work its
+    own caller hasn't done yet.
+
+    Returns `{"was": <old pinned baseline sha, or None>,
+              "lane_entries_dropped": <int>,
+              "receipt_archived": <path relative to run_dir, or None>}`.
+    """
+    was = read_pinned_baseline(run_dir, job_id, entry)
+    pin_path = baseline_pin_path(run_dir, job_id)
+    if os.path.exists(pin_path):
+        os.remove(pin_path)
+    entry.pop("baseline", None)
+    entry["status"] = "pending"
+    entry["worktree"] = None
+    lane_entries_dropped = 0
+    if wts is not None:
+        dropped = [cwd for cwd, jid in wts.items()
+                  if jid == job_id and cwd != keep_cwd]
+        for cwd in dropped:
+            wts.pop(cwd, None)
+        lane_entries_dropped = len(dropped)
+    receipt_archived = None
+    receipt = os.path.join(run_dir, "receipts", "%s.gate.json" % job_id)
+    if os.path.exists(receipt):
+        doc = _read_json(receipt, None) or {}
+        tag = (str(doc.get("realised_commit") or "")[:12]
+               or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        dest = os.path.join(run_dir, "receipts", "%s.gate.superseded-%s.json" % (job_id, tag))
+        n = 2
+        while os.path.exists(dest):  # a second attempt at the same commit must not clobber the first
+            dest = os.path.join(run_dir, "receipts", "%s.gate.superseded-%s-%d.json" % (job_id, tag, n))
+            n += 1
+        os.replace(receipt, dest)
+        receipt_archived = os.path.relpath(dest, run_dir)
+    return {"was": was, "lane_entries_dropped": lane_entries_dropped,
+            "receipt_archived": receipt_archived}
+
+
+# --------------------------------------------------------------------------- #
 # register-lane
 # --------------------------------------------------------------------------- #
 def cmd_register_lane(argv):
@@ -6038,6 +6177,69 @@ def cmd_register_lane(argv):
         except Exception:  # noqa: BLE001 — an unreadable manifest is the validator's problem, not this flag's
             _reg_manifest, _reg_job = {}, None
             _is_external_wrapper = False
+
+    # ---- RE-ATTEMPT: retire a concluded previous attempt, BEFORE this lane is
+    # registered (v3.6.3) ----------------------------------------------------
+    # Must run before `register_lane(...)` below: that call is what adds THIS
+    # registration's worktree entry to lane-map.json, and the worktree branch's
+    # lane-map cleanup (inside `_supersede_attempt`) must not run after it and
+    # drop the very entry being added. `keep_cwd` is a second guard against the
+    # same hazard, not a substitute for the ordering.
+    _reg_ack_reattempt = None
+    _reg_ack_stale_pin_warning = None
+    _reg_state_peek = _load_state(run_dir)
+    _reg_state_entry = (_reg_state_peek.get("jobs") or {}).get(args.job_id) or {}
+    if args.isolation == "worktree" and _prior_attempt_concluded(
+            run_dir, args.job_id, _reg_state_entry):
+        with _run_dir_lock(run_dir):
+            _reg_state = _load_state(run_dir)
+            _reg_entry = _reg_state["jobs"].setdefault(args.job_id, {})
+            _reg_lm = _read_json(lane_map_path(run_dir), None)
+            _reg_wts = (_reg_lm.get("worktrees")
+                       if isinstance(_reg_lm, dict) and isinstance(_reg_lm.get("worktrees"), dict)
+                       else None)
+            _reg_result = _supersede_attempt(
+                run_dir, args.job_id, _reg_entry, _reg_wts,
+                keep_cwd=os.path.abspath(args.cwd))
+            if _reg_wts is not None:
+                _reg_lm["worktrees"] = _reg_wts
+                _atomic_write(lane_map_path(run_dir),
+                              json.dumps(_reg_lm, indent=2, sort_keys=True) + "\n")
+            _save_state(run_dir, _reg_state)
+        # The old before-image is for a DIFFERENT worktree — its digests describe
+        # a tree that no longer exists — so it must go too, along with its
+        # verified subset, so the worktree branch below re-runs `provision_command`
+        # and re-photographs the fresh tree rather than trusting a stale picture.
+        _reg_snapshot_cleared = False
+        for _reg_snap in (
+            os.path.join(run_dir, "preexisting", "%s.txt" % args.job_id),
+            os.path.join(run_dir, "preexisting", "%s.verified.txt" % args.job_id),
+        ):
+            if os.path.exists(_reg_snap):
+                os.remove(_reg_snap)
+                _reg_snapshot_cleared = True
+        _reg_ack_reattempt = {
+            "superseded_receipt": _reg_result["receipt_archived"],
+            "unpinned_was": _reg_result["was"],
+            "snapshot_cleared": _reg_snapshot_cleared,
+        }
+    elif args.isolation == "direct" and _prior_attempt_concluded(
+            run_dir, args.job_id, _reg_state_entry):
+        # A direct worker can write ANYWHERE in the checkout, including a forged
+        # `results/<id>.json` — the one file `_prior_attempt_concluded` trusts —
+        # so the one-shot pin rule must hold here regardless. This only WARNS;
+        # it changes nothing about the pin the code below writes (or, since one
+        # already exists, does not rewrite).
+        _reg_existing_pin = read_pinned_baseline(run_dir, args.job_id, _reg_state_entry)
+        _reg_current_head = _head_commit(os.path.abspath(args.repo_root))
+        if _reg_existing_pin and _reg_current_head and _reg_existing_pin != _reg_current_head:
+            _reg_ack_stale_pin_warning = (
+                "the pinned baseline %s predates HEAD %s; the gate will charge "
+                "this job with every commit made since — run `resume-prepare "
+                "--run-dir %s` (or `/v:resume`) before re-dispatching this direct "
+                "job." % (_reg_existing_pin, _reg_current_head, run_dir)
+            )
+
     lane = register_lane(
         run_dir, args.job_id, args.cwd,
         manifest_path=args.manifest, agent_id=args.agent_id, wrapper=_is_external_wrapper,
@@ -6045,6 +6247,10 @@ def cmd_register_lane(argv):
     ack = {"registered": args.job_id,
            "worktrees": len(lane.get("worktrees") or {}),
            "agents": len(lane.get("agents") or {})}
+    if _reg_ack_reattempt is not None:
+        ack["reattempt"] = _reg_ack_reattempt
+    if _reg_ack_stale_pin_warning:
+        ack["stale_pin_warning"] = _reg_ack_stale_pin_warning
 
     # ---- SNAPSHOT WHAT WAS ALREADY DIRTY, before the implementer runs ------ #
     # Direct mode only. The gate measures the whole tree against the baseline, so
@@ -6153,6 +6359,19 @@ def cmd_register_lane(argv):
     # state.json. Every job in a wave writes state.json, so a value that lived
     # only there could be lost to a sibling's save; the per-job file has exactly
     # one writer.
+    #
+    # The pin below is otherwise ONE-SHOT (`if not os.path.exists(pin_path)`) —
+    # right against a WORKER re-registering after it has already committed. What
+    # makes this block also correct for a HUMAN re-running `/v:dispatch` on a
+    # halted run is the re-attempt handling ABOVE, before `register_lane(...)`:
+    # for a worktree job whose previous attempt concluded (a receipt or a result
+    # already on disk, and not `merged.integrated`), it already removed the old
+    # pin file and popped `entry["baseline"]`, so `read_pinned_baseline` below
+    # finds nothing and this block pins the NEW worktree's HEAD instead of
+    # silently keeping the old one. A direct job's pin is never touched by that
+    # block — only warned about — so its one-shot rule holds unconditionally;
+    # `/v:resume`'s `resume-prepare` (which calls the same `_supersede_attempt`
+    # helper) remains the only way to clear a direct job's stale pin.
     repo_root = os.path.abspath(args.repo_root)
     pin_root = repo_root if args.isolation == "direct" else os.path.abspath(args.cwd)
     baseline = _head_commit(pin_root)
@@ -10022,6 +10241,306 @@ def selftest():
                    _pj_cmd is None, str(_pj_cmd))
             _check("...and its timeout is ignored too, so the pair cannot half-apply",
                    _pj_timeout == PROVISION_TIMEOUT_DEFAULT, str(_pj_timeout))
+
+            # ==== v3.6.3 (issue #22) ==========================================
+            # A: `toolchain_artifacts` threaded emit -> scope-check -> receipt,
+            #    and to an external worker's own argv.
+            # B: a worktree job's baseline re-pins on a concluded re-attempt;
+            #    a direct job's stale pin only warns.
+
+            # ---- A1: _run_scope_check emits the flag itself -------------------
+            _fake_scope363 = os.path.join(tmp, "fake-scope-check.py")
+            _atomic_write(_fake_scope363,
+                         "import sys, json\nprint(json.dumps({'argv': sys.argv[1:]}))\n")
+            _, _, _, _a1_parsed = _run_scope_check(
+                _fake_scope363, "worktree", tmp, None, [], sys.executable,
+                toolchain_artifacts=["build/**", "reports/*.json"])
+            _check("A1: _run_scope_check emits --toolchain-artifact per glob",
+                   _a1_parsed is not None
+                   and _a1_parsed["argv"].count("--toolchain-artifact") == 2
+                   and "build/**" in _a1_parsed["argv"]
+                   and "reports/*.json" in _a1_parsed["argv"],
+                   json.dumps(_a1_parsed))
+            _, _, _, _a1n_parsed = _run_scope_check(
+                _fake_scope363, "worktree", tmp, None, [], sys.executable,
+                toolchain_artifacts=None)
+            _check("A1: ...and nothing when toolchain_artifacts is None",
+                   _a1n_parsed is not None
+                   and "--toolchain-artifact" not in _a1n_parsed["argv"],
+                   json.dumps(_a1n_parsed))
+
+            # ---- A2/A3: gate-receipt end-to-end --------------------------------
+            def _ta_repo363(tag, ta_globs):
+                repo = os.path.join(tmp, "v363-ta-" + tag)
+                _init_repo(repo)
+                # The .gitignore is committed BEFORE the baseline is pinned, so
+                # `git check-ignore` at gate time sees it in the gated tree.
+                _atomic_write(os.path.join(repo, ".gitignore"), "build/\n")
+                _run(["git", "-C", repo, "add", "-A"])
+                _run(["git", "-C", repo, "commit", "-q", "-m", "gitignore build/"])
+                wt = os.path.join(tmp, "v363-tawt-" + tag)
+                _run(["git", "-C", repo, "worktree", "add", "-q", "--detach", wt, "HEAD"])
+                run_dir = os.path.join(repo, "docs", "superpowers", "execution", "ta363")
+                os.makedirs(run_dir, exist_ok=True)
+                doc = {"run_id": "ta363", "toolchain_artifacts": ta_globs,
+                      "jobs": [{"id": "w1", "isolation": "worktree",
+                                "write_allowed": ["src/**"]}]}
+                man = os.path.join(run_dir, "manifest.yaml")
+                with open(man, "w", encoding="utf-8") as fh:
+                    _yaml36.safe_dump(doc, fh)
+                return repo, wt, run_dir, man
+
+            _ta2_repo, _ta2_wt, _ta2_run, _ta2_man = _ta_repo363("pass", ["build/**"])
+            with _quiet():
+                cmd_register_lane(["--run-dir", _ta2_run, "--job-id", "w1",
+                                   "--cwd", _ta2_wt, "--repo-root", _ta2_repo,
+                                   "--isolation", "worktree", "--manifest", _ta2_man,
+                                   "--no-test-contract"])
+            os.makedirs(os.path.join(_ta2_wt, "build"), exist_ok=True)
+            _atomic_write(os.path.join(_ta2_wt, "build", "out.js"), "built\n")
+            # An in-lane write too — otherwise the ONLY change is the forgiven
+            # artifact, `changed` comes back empty, and the no-work guard blocks
+            # the job for doing nothing, which is a different failure than the
+            # one this row means to test.
+            os.makedirs(os.path.join(_ta2_wt, "src"), exist_ok=True)
+            _atomic_write(os.path.join(_ta2_wt, "src", "work.txt"), "in lane\n")
+            with _quiet():
+                _rc_ta2 = cmd_gate_receipt(["--run-dir", _ta2_run, "--job-id", "w1",
+                                           "--repo-root", _ta2_repo, "--worktree", _ta2_wt,
+                                           "--manifest", _ta2_man, "--mode", "worktree"])
+            _ta2_rcpt = _read_json(os.path.join(_ta2_run, "receipts", "w1.gate.json"),
+                                   {}) or {}
+            _ta2_raw = {}
+            try:
+                _ta2_raw = json.loads(_ta2_rcpt.get("raw_stdout") or "{}")
+            except ValueError:
+                pass
+            _check("A2: a manifest-declared toolchain_artifacts glob forgives a "
+                   "gitignored build artifact — verdict pass, forgiven path named, "
+                   "and absent from `changed`",
+                   _rc_ta2 == 0 and _ta2_rcpt.get("verdict") == "pass"
+                   and _ta2_rcpt.get("toolchain_artifacts") == ["build/out.js"]
+                   and "build/out.js" not in (_ta2_raw.get("changed") or []),
+                   json.dumps(_ta2_rcpt)[:300])
+
+            _ta3_repo, _ta3_wt, _ta3_run, _ta3_man = _ta_repo363("blocked", ["other/**"])
+            with _quiet():
+                cmd_register_lane(["--run-dir", _ta3_run, "--job-id", "w1",
+                                   "--cwd", _ta3_wt, "--repo-root", _ta3_repo,
+                                   "--isolation", "worktree", "--manifest", _ta3_man,
+                                   "--no-test-contract"])
+            os.makedirs(os.path.join(_ta3_wt, "build"), exist_ok=True)
+            _atomic_write(os.path.join(_ta3_wt, "build", "out.js"), "built\n")
+            os.makedirs(os.path.join(_ta3_wt, "src"), exist_ok=True)
+            _atomic_write(os.path.join(_ta3_wt, "src", "work.txt"), "in lane\n")
+            with _quiet():
+                _rc_ta3 = cmd_gate_receipt(["--run-dir", _ta3_run, "--job-id", "w1",
+                                           "--repo-root", _ta3_repo, "--worktree", _ta3_wt,
+                                           "--manifest", _ta3_man, "--mode", "worktree"])
+            _ta3_rcpt = _read_json(os.path.join(_ta3_run, "receipts", "w1.gate.json"),
+                                   {}) or {}
+            _check("A3: a glob that does NOT match the artifact leaves it BLOCKED "
+                   "(anti-vacuity for A2 — the exemption is narrow, not by name)",
+                   _rc_ta3 == 0 and _ta3_rcpt.get("verdict") == "blocked"
+                   and "build/out.js" in str(_ta3_rcpt.get("raw_stdout")),
+                   json.dumps(_ta3_rcpt)[:300])
+
+            # ---- A4: the flag reaches an external worker's own argv -----------
+            _ta4_man = {"run_id": "r", "toolchain_artifacts":
+                       ["tsconfig.tsbuildinfo", "reports/*.json"],
+                       "jobs": [{"id": "x", "backend": "codex", "model": "gpt-5.6-sol",
+                                 "isolation": "worktree", "write_allowed": ["src/**"]}]}
+            _ta4_argv = build_plan(_with_body(_ta4_man), tmp, tmp, "/usr/bin/python3",
+                                   os.path.abspath(__file__), SCOPE_CHECK_DEFAULT,
+                                   FASTPATH_DEFAULT, HERE)["waves"][0][0]["launch_argv"]
+            _check("A4: an external job's launch argv carries --toolchain-artifact "
+                   "per manifest-declared glob",
+                   _ta4_argv.count("--toolchain-artifact") == 2
+                   and "tsconfig.tsbuildinfo" in _ta4_argv
+                   and "reports/*.json" in _ta4_argv,
+                   " ".join(_ta4_argv))
+            _ta4b_man = {"run_id": "r",
+                        "jobs": [{"id": "x", "backend": "codex", "model": "gpt-5.6-sol",
+                                  "isolation": "worktree", "write_allowed": ["src/**"]}]}
+            _ta4b_argv = build_plan(_with_body(_ta4b_man), tmp, tmp, "/usr/bin/python3",
+                                    os.path.abspath(__file__), SCOPE_CHECK_DEFAULT,
+                                    FASTPATH_DEFAULT, HERE)["waves"][0][0]["launch_argv"]
+            _check("A4: ...and none when the manifest declares no toolchain_artifacts",
+                   "--toolchain-artifact" not in _ta4b_argv, " ".join(_ta4b_argv))
+
+            # ---- B1: worktree re-attempt re-pins the baseline ------------------
+            _repo_b1 = os.path.join(tmp, "v363-reattempt")
+            _head0_b1 = _init_repo(_repo_b1)
+            _wt1_b1 = os.path.join(tmp, "v363-reattempt-wt1")
+            _run(["git", "-C", _repo_b1, "worktree", "add", "-q", "--detach", _wt1_b1, "HEAD"])
+            _run_b1 = os.path.join(_repo_b1, "docs", "superpowers", "execution", "b1")
+            os.makedirs(_run_b1, exist_ok=True)
+            _man_b1 = os.path.join(_run_b1, "manifest.yaml")
+            with open(_man_b1, "w", encoding="utf-8") as fh:
+                _yaml36.safe_dump({"run_id": "b1", "provision_command": _prov_cmd36,
+                                   "jobs": [{"id": "w1", "isolation": "worktree",
+                                             "write_allowed": ["src/**"]}]}, fh)
+            with _quiet():
+                cmd_register_lane(["--run-dir", _run_b1, "--job-id", "w1",
+                                   "--cwd", _wt1_b1, "--repo-root", _repo_b1,
+                                   "--isolation", "worktree", "--manifest", _man_b1,
+                                   "--no-test-contract"])
+            _snap_b1 = os.path.join(_run_b1, "preexisting", "w1.txt")
+            _check("B1 setup: the first registration pinned HEAD0 and photographed "
+                   "provisioning",
+                   read_pinned_baseline(_run_b1, "w1") == _head0_b1
+                   and os.path.isfile(_snap_b1))
+            os.makedirs(os.path.join(_run_b1, "receipts"), exist_ok=True)
+            _atomic_write(os.path.join(_run_b1, "receipts", "w1.gate.json"),
+                         json.dumps({"job_id": "w1", "verdict": "pass"}) + "\n")
+            _ino_b1_before = os.stat(_snap_b1).st_ino
+            # a pipeline bookkeeping commit lands on the main repo between attempts
+            _atomic_write(os.path.join(_repo_b1, "between.txt"), "between attempts\n")
+            _run(["git", "-C", _repo_b1, "add", "-A"])
+            _run(["git", "-C", _repo_b1, "commit", "-q", "-m", "bookkeeping between attempts"])
+            _head1_b1 = _head_commit(_repo_b1)
+            _wt2_b1 = os.path.join(tmp, "v363-reattempt-wt2")
+            _run(["git", "-C", _repo_b1, "worktree", "add", "-q", "--detach", _wt2_b1, "HEAD"])
+            _rc_b1, _ack_b1 = _cap36(cmd_register_lane, [
+                "--run-dir", _run_b1, "--job-id", "w1", "--cwd", _wt2_b1,
+                "--repo-root", _repo_b1, "--isolation", "worktree",
+                "--manifest", _man_b1, "--no-test-contract"])
+            _check("B1: register-lane re-pins a worktree job's baseline to the NEW "
+                   "HEAD on a concluded re-attempt",
+                   read_pinned_baseline(_run_b1, "w1") == _head1_b1
+                   and (_ack_b1.get("reattempt") or {}).get("unpinned_was") == _head0_b1,
+                   json.dumps(_ack_b1)[:300])
+            _b1_archived = [n for n in os.listdir(os.path.join(_run_b1, "receipts"))
+                           if n.startswith("w1.gate.superseded-")]
+            _check("B1: ...archives the old receipt so it is never read as this "
+                   "attempt's verdict",
+                   len(_b1_archived) == 1
+                   and (_ack_b1.get("reattempt") or {}).get("superseded_receipt")
+                       == os.path.join("receipts", _b1_archived[0]),
+                   str(_b1_archived))
+            _b1_state = _load_state(_run_b1)
+            _check("B1: state.json's job baseline agrees with the fresh pin",
+                   (_b1_state["jobs"].get("w1") or {}).get("baseline") == _head1_b1)
+            _ino_b1_after = (os.stat(_snap_b1).st_ino if os.path.isfile(_snap_b1)
+                            else None)
+            _check("B1: the stale before-image is cleared and re-taken for the "
+                   "fresh worktree (a new file, not the old one kept)",
+                   (_ack_b1.get("reattempt") or {}).get("snapshot_cleared") is True
+                   and _ino_b1_after is not None and _ino_b1_after != _ino_b1_before,
+                   "ino before=%s after=%s" % (_ino_b1_before, _ino_b1_after))
+
+            # ---- B2: same attempt, no receipt/result yet -> pin stays put -----
+            _repo_b2 = os.path.join(tmp, "v363-sameattempt")
+            _head0_b2 = _init_repo(_repo_b2)
+            _wt1_b2 = os.path.join(tmp, "v363-sameattempt-wt1")
+            _run(["git", "-C", _repo_b2, "worktree", "add", "-q", "--detach", _wt1_b2, "HEAD"])
+            _run_b2 = os.path.join(_repo_b2, "docs", "superpowers", "execution", "b2")
+            os.makedirs(_run_b2, exist_ok=True)
+            _man_b2 = os.path.join(_run_b2, "manifest.yaml")
+            with open(_man_b2, "w", encoding="utf-8") as fh:
+                _yaml36.safe_dump({"run_id": "b2", "jobs": [
+                    {"id": "w1", "isolation": "worktree",
+                     "write_allowed": ["src/**"]}]}, fh)
+            with _quiet():
+                cmd_register_lane(["--run-dir", _run_b2, "--job-id", "w1",
+                                   "--cwd", _wt1_b2, "--repo-root", _repo_b2,
+                                   "--isolation", "worktree", "--manifest", _man_b2,
+                                   "--no-test-contract"])
+            # NO receipt, NO result written — the worker merely re-registers
+            # (the clamp legitimately admits repeated calls in the same attempt).
+            _atomic_write(os.path.join(_repo_b2, "extra.txt"), "unrelated commit\n")
+            _run(["git", "-C", _repo_b2, "add", "-A"])
+            _run(["git", "-C", _repo_b2, "commit", "-q", "-m", "unrelated commit"])
+            _rc_b2, _ack_b2 = _cap36(cmd_register_lane, [
+                "--run-dir", _run_b2, "--job-id", "w1", "--cwd", _wt1_b2,
+                "--repo-root", _repo_b2, "--isolation", "worktree",
+                "--manifest", _man_b2, "--no-test-contract"])
+            _check("B2: with no concluded prior attempt, re-registering the SAME "
+                   "attempt keeps the original pin — the one-shot rule holds "
+                   "against a worker that merely re-registers",
+                   read_pinned_baseline(_run_b2, "w1") == _head0_b2
+                   and "reattempt" not in _ack_b2,
+                   json.dumps(_ack_b2)[:300])
+
+            # ---- B3: concluded but INTEGRATED -> not treated as a re-attempt --
+            _repo_b3 = os.path.join(tmp, "v363-integrated")
+            _head0_b3 = _init_repo(_repo_b3)
+            _wt1_b3 = os.path.join(tmp, "v363-integrated-wt1")
+            _run(["git", "-C", _repo_b3, "worktree", "add", "-q", "--detach", _wt1_b3, "HEAD"])
+            _run_b3 = os.path.join(_repo_b3, "docs", "superpowers", "execution", "b3")
+            os.makedirs(_run_b3, exist_ok=True)
+            _man_b3 = os.path.join(_run_b3, "manifest.yaml")
+            with open(_man_b3, "w", encoding="utf-8") as fh:
+                _yaml36.safe_dump({"run_id": "b3", "jobs": [
+                    {"id": "w1", "isolation": "worktree",
+                     "write_allowed": ["src/**"]}]}, fh)
+            with _quiet():
+                cmd_register_lane(["--run-dir", _run_b3, "--job-id", "w1",
+                                   "--cwd", _wt1_b3, "--repo-root", _repo_b3,
+                                   "--isolation", "worktree", "--manifest", _man_b3,
+                                   "--no-test-contract"])
+            os.makedirs(os.path.join(_run_b3, "receipts"), exist_ok=True)
+            _atomic_write(os.path.join(_run_b3, "receipts", "w1.gate.json"),
+                         json.dumps({"job_id": "w1", "verdict": "pass"}) + "\n")
+            _b3_state = _load_state(_run_b3)
+            _b3_state["jobs"].setdefault("w1", {})["merged"] = {"integrated": True}
+            _save_state(_run_b3, _b3_state)
+            _atomic_write(os.path.join(_repo_b3, "extra.txt"), "commit after integration\n")
+            _run(["git", "-C", _repo_b3, "add", "-A"])
+            _run(["git", "-C", _repo_b3, "commit", "-q", "-m", "commit after integration"])
+            _wt2_b3 = os.path.join(tmp, "v363-integrated-wt2")
+            _run(["git", "-C", _repo_b3, "worktree", "add", "-q", "--detach", _wt2_b3, "HEAD"])
+            _rc_b3, _ack_b3 = _cap36(cmd_register_lane, [
+                "--run-dir", _run_b3, "--job-id", "w1", "--cwd", _wt2_b3,
+                "--repo-root", _repo_b3, "--isolation", "worktree",
+                "--manifest", _man_b3, "--no-test-contract"])
+            _check("B3: an INTEGRATED job's registration is never treated as a "
+                   "re-attempt — there is nothing left to supersede",
+                   read_pinned_baseline(_run_b3, "w1") == _head0_b3
+                   and "reattempt" not in _ack_b3,
+                   json.dumps(_ack_b3)[:300])
+
+            # ---- B4: direct re-attempt with a stale pin -> warn, never re-pin -
+            _repo_b4 = os.path.join(tmp, "v363-directstale")
+            _head0_b4 = _init_repo(_repo_b4)
+            _run_b4 = os.path.join(_repo_b4, "docs", "superpowers", "execution", "b4")
+            os.makedirs(_run_b4, exist_ok=True)
+            _man_b4 = os.path.join(_run_b4, "manifest.yaml")
+            with open(_man_b4, "w", encoding="utf-8") as fh:
+                _yaml36.safe_dump({"run_id": "b4", "jobs": [
+                    {"id": "w1", "isolation": "direct",
+                     "write_allowed": ["src/**"]}]}, fh)
+            with _quiet():
+                cmd_register_lane(["--run-dir", _run_b4, "--job-id", "w1",
+                                   "--cwd", _repo_b4, "--repo-root", _repo_b4,
+                                   "--isolation", "direct", "--manifest", _man_b4,
+                                   "--no-test-contract"])
+            os.makedirs(os.path.join(_run_b4, "receipts"), exist_ok=True)
+            _atomic_write(os.path.join(_run_b4, "receipts", "w1.gate.json"),
+                         json.dumps({"job_id": "w1", "verdict": "pass"}) + "\n")
+            _atomic_write(os.path.join(_repo_b4, "extra.txt"),
+                         "commit after direct attempt\n")
+            _run(["git", "-C", _repo_b4, "add", "-A"])
+            _run(["git", "-C", _repo_b4, "commit", "-q", "-m", "commit after direct attempt"])
+            _head1_b4 = _head_commit(_repo_b4)
+            _rc_b4, _ack_b4 = _cap36(cmd_register_lane, [
+                "--run-dir", _run_b4, "--job-id", "w1", "--cwd", _repo_b4,
+                "--repo-root", _repo_b4, "--isolation", "direct",
+                "--manifest", _man_b4, "--no-test-contract"])
+            _check("B4: a DIRECT job's stale pin is never silently re-pinned — a "
+                   "direct worker can write anywhere, including a forged result — "
+                   "and the warning names both SHAs and `resume-prepare`",
+                   read_pinned_baseline(_run_b4, "w1") == _head0_b4
+                   and "reattempt" not in _ack_b4
+                   and "resume-prepare" in str(_ack_b4.get("stale_pin_warning"))
+                   and _head0_b4 in str(_ack_b4.get("stale_pin_warning"))
+                   and _head1_b4 in str(_ack_b4.get("stale_pin_warning")),
+                   json.dumps(_ack_b4)[:400])
+
+            # ---- B5: resume-prepare's existing rows are unaffected by the
+            # extraction into `_supersede_attempt` — asserted by running the
+            # WHOLE selftest (see the "146" section above, ~line 8920), which
+            # this function does unconditionally; nothing further to add here.
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -10047,7 +10566,9 @@ def cmd_resume_prepare(argv):
     and the state `baseline`, set `status: pending`, clear `worktree`, drop its
     lane-map worktree entries, and move `receipts/<id>.gate.json` aside as
     `receipts/<id>.gate.superseded-<realised-or-ts>.json` so the integration
-    authority never reads the crashed attempt's verdict as this attempt's.
+    authority never reads the crashed attempt's verdict as this attempt's — via
+    `_supersede_attempt`, the same helper `register-lane` now calls on its own
+    re-attempt door (v3.6.3), so the two paths retire an attempt identically.
     Integrated jobs are untouched HERE — `out["kept"]` below is exactly
     `cmd_integrated_jobs`'s `integrated` list, read from the same state — and
     the emitted script's own wave loop (`alreadyIntegratedIds` in JS_TEMPLATE)
@@ -10055,6 +10576,12 @@ def cmd_resume_prepare(argv):
     that second half, the relaunch re-ran Implement and Gate on every job kept
     here, and the Gate could only ever refuse (finding 146's twin for a job that
     already merged). The phase returns to PARTITION_VERIFIED.
+
+    This remains the ONLY path that clears a `direct` job's pin: a direct
+    worker can write anywhere in the checkout, including a forged
+    `results/<id>.json`, so `register-lane`'s own re-attempt door only WARNS
+    for a direct job (`ack["stale_pin_warning"]`) rather than re-pinning it —
+    the operator is expected to run this command (or `/v:resume`) first.
     """
     ap = argparse.ArgumentParser(prog="compound-v-emit-workflow.py resume-prepare")
     ap.add_argument("--run-dir", required=True)
@@ -10082,31 +10609,11 @@ def cmd_resume_prepare(argv):
                     and isinstance(wt, str) and wt and os.path.isdir(wt)):
                 out.setdefault("resume_in_place", []).append(job_id)
                 continue
-            was = read_pinned_baseline(run_dir, job_id, entry)
-            pin_path = baseline_pin_path(run_dir, job_id)
-            if os.path.exists(pin_path):
-                os.remove(pin_path)
-            entry.pop("baseline", None)
-            entry["status"] = "pending"
-            entry["worktree"] = None
-            if wts is not None:
-                dropped = [cwd for cwd, jid in wts.items() if jid == job_id]
-                for cwd in dropped:
-                    wts.pop(cwd, None)
-                out["lane_entries_dropped"] += len(dropped)
-            receipt = os.path.join(run_dir, "receipts", "%s.gate.json" % job_id)
-            if os.path.exists(receipt):
-                doc = _read_json(receipt, None) or {}
-                tag = (str(doc.get("realised_commit") or "")[:12]
-                       or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-                dest = os.path.join(run_dir, "receipts", "%s.gate.superseded-%s.json" % (job_id, tag))
-                n = 2
-                while os.path.exists(dest):  # a second attempt at the same commit must not clobber the first
-                    dest = os.path.join(run_dir, "receipts", "%s.gate.superseded-%s-%d.json" % (job_id, tag, n))
-                    n += 1
-                os.replace(receipt, dest)
-                out["receipts_archived"].append(os.path.relpath(dest, run_dir))
-            out["unpinned"].append({"job": job_id, "was": was})
+            _res = _supersede_attempt(run_dir, job_id, entry, wts)
+            out["lane_entries_dropped"] += _res["lane_entries_dropped"]
+            if _res["receipt_archived"]:
+                out["receipts_archived"].append(_res["receipt_archived"])
+            out["unpinned"].append({"job": job_id, "was": _res["was"]})
         if wts is not None:
             lm["worktrees"] = wts
             _atomic_write(lane_map_path(run_dir), json.dumps(lm, indent=2, sort_keys=True) + "\n")

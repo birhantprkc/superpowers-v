@@ -2372,6 +2372,74 @@ def _string_list_problems(value, label):
     return problems
 
 
+# A glob is a catch-all if, after stripping a leading './' or '/', it reduces
+# to one of these — i.e. it would match every path in the tree. Kept as a
+# closed tuple (mirrors RETRY_ALLOWED_KEYS etc.) rather than a "looks broad"
+# heuristic, so the rule stays boring and inspectable.
+_CATCH_ALL_TOOLCHAIN_GLOBS = ("*", "**", "**/*")
+
+
+def _validate_toolchain_artifacts(manifest):
+    """Return violations for the optional top-level ``toolchain_artifacts``
+    list (issue #22): globs naming build/test-tool bookkeeping paths (a
+    TypeScript incremental build cache, a Vitest results cache under
+    ``node_modules/.vite/``, ...) that a downstream toolchain's own first run
+    drops into a fresh worktree, gitignored, after the scope gate's
+    post-provisioning snapshot was taken. ``write_allowed`` cannot name them
+    without widening a job's disjoint lane, so this list is a SEPARATE,
+    human-reviewed exemption the scope gate (``compound-v-scope-check.py``)
+    only honours when ``git check-ignore`` independently reconfirms the path
+    is actually gitignored at gate time — this validator checks only the
+    manifest's SHAPE, never git state.
+
+    ABSENT or ``None`` is valid — every manifest committed before this field
+    existed has neither key, and a bare ``toolchain_artifacts:`` line parses to
+    None (same absent-vs-null rule as ``global_constraints``).
+
+    Beyond the shared list-of-non-empty-strings shape check, two further rules
+    apply, because a permissive shape check alone would let a reviewer wave
+    through a glob that quietly defeats the gate:
+      * a CATCH-ALL glob is refused outright — one of ``*``, ``**``, ``**/*``,
+        ``/**``, ``./**``, or any entry whose form (after stripping one leading
+        ``./`` or ``/``) reduces to ``*``, ``**``, or ``**/*``. Such a glob would
+        exempt every gitignored write in the entire tree, which is exactly the
+        blanket carve-out the scope gate's docstring says it never originates
+        on its own — a catch-all here would make this manifest originate one
+        instead.
+      * an entry containing a newline is refused — the same single-line
+        discipline ``_validate_provision`` applies to ``provision_command``,
+        so a multi-line string can't smuggle a second (unreviewed) glob past a
+        reviewer skimming one line per bullet."""
+    if "toolchain_artifacts" not in manifest:
+        return []
+    value = manifest.get("toolchain_artifacts")
+    if value is None:
+        return []
+    problems = _string_list_problems(value, "manifest 'toolchain_artifacts'")
+    if not isinstance(value, list):
+        return problems
+    for idx, item in enumerate(value):
+        if not isinstance(item, str):
+            continue  # already reported by _string_list_problems
+        if "\n" in item:
+            problems.append(
+                "manifest 'toolchain_artifacts'[%d] must be a single-line "
+                "string (got %r)" % (idx, item)
+            )
+            continue
+        normalized = item
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
+        if normalized in _CATCH_ALL_TOOLCHAIN_GLOBS:
+            problems.append(
+                "manifest 'toolchain_artifacts'[%d] is a catch-all glob (%r) "
+                "— this would exempt every gitignored write in the tree; name "
+                "the specific toolchain-artifact paths instead" % (idx, item)
+            )
+    return problems
+
+
 def _validate_global_constraints(manifest):
     """Return violations for the optional top-level ``global_constraints`` list
     (v3.4.17): the plan's ``## Global Constraints`` lines, copied VERBATIM.
@@ -2526,6 +2594,11 @@ def validate(manifest, mode=None, repo_root=None, config_path=None,
     # provision_command / provision_timeout_s: same reasoning as the blocks above —
     # checked before the jobs early-return so a broken manifest never hides them.
     problems.extend(_validate_provision(manifest))
+
+    # toolchain_artifacts (issue #22): same reasoning as the blocks above —
+    # checked before the jobs early-return so a broken manifest never hides a
+    # catch-all glob or a malformed list.
+    problems.extend(_validate_toolchain_artifacts(manifest))
 
     jobs = manifest.get("jobs")
     if not isinstance(jobs, list) or not jobs:
@@ -5994,6 +6067,48 @@ def _selftest():
     expect("provision: provision_command with a newline is FAIL",
            any("provision_command" in p for p in
                _validate_provision({"provision_command": "npm ci\nrm -rf /"})))
+
+    # --- issue #22: top-level toolchain_artifacts ------------------------------
+    expect("toolchain_artifacts: absent is valid (no key at all)",
+           validate_text(_v3_manifest()) == [])
+    expect("toolchain_artifacts: a valid list of specific globs is PASS",
+           validate_text(_prov(
+               'toolchain_artifacts: ["tsconfig.tsbuildinfo", '
+               '"node_modules/.vite/**"]\n')) == [])
+    expect("toolchain_artifacts: a bare string (not a list) is FAIL",
+           any("toolchain_artifacts" in p for p in
+               validate_text(_prov('toolchain_artifacts: "x"\n'))))
+    expect("toolchain_artifacts: [\"**\"] (catch-all) is FAIL",
+           any("toolchain_artifacts" in p and "catch-all" in p for p in
+               validate_text(_prov('toolchain_artifacts: ["**"]\n'))))
+    expect("toolchain_artifacts: [\"\"] (empty entry) is FAIL",
+           any("toolchain_artifacts" in p for p in
+               validate_text(_prov('toolchain_artifacts: [""]\n'))))
+    expect("toolchain_artifacts: null (bare key) is valid (same absent-vs-null "
+           "rule as global_constraints)",
+           validate_text(_prov("toolchain_artifacts:\n")) == [])
+    # Every other catch-all spelling is refused too, not just bare "**".
+    for _glob in ("*", "**/*", "/**", "./**"):
+        expect("toolchain_artifacts: %r is a catch-all and FAILS" % _glob,
+               any("catch-all" in p for p in _validate_toolchain_artifacts(
+                   {"toolchain_artifacts": [_glob]})))
+    # A catch-all mixed in with legitimate globs still fails the whole list —
+    # one bad entry is enough, the good ones don't dilute it.
+    expect("toolchain_artifacts: a catch-all mixed with valid globs still FAILS",
+           any("catch-all" in p for p in _validate_toolchain_artifacts(
+               {"toolchain_artifacts": ["tsconfig.tsbuildinfo", "**"]})))
+    # A newline inside one entry is refused, same single-line discipline as
+    # provision_command.
+    expect("toolchain_artifacts: an entry with a newline is FAIL",
+           any("toolchain_artifacts" in p and "single-line" in p
+               for p in _validate_toolchain_artifacts(
+                   {"toolchain_artifacts": ["tsconfig.tsbuildinfo\nrm -rf /"]})))
+    # A non-string entry (bool/int) is caught by the shared shape check, not the
+    # catch-all check crashing on a non-string.
+    expect("toolchain_artifacts: a non-string entry (True) is FAIL, not a crash",
+           any("toolchain_artifacts" in p for p in _validate_toolchain_artifacts(
+               {"toolchain_artifacts": [True]})))
+
     # The SHIPPED example must not trip the advisory it documents.
     _ex = os.path.join(_repo3, "examples", "manifest.example.yaml")
     if os.path.isfile(_ex):

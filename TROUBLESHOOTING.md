@@ -132,6 +132,16 @@ Two consequences worth knowing before you use it:
 Do not "fix" this by widening `write_allowed` to `node_modules/**`. That hands the job a lane it can write anything into for the rest of
 the run, and the gate will agree with it.
 
+## Scope gate BLOCKS `tsconfig.tsbuildinfo` / a vitest or jest cache / `.next/` that the job never wrote
+
+**Symptom:** a job is BLOCKED with violations under a single build-artifact path — `tsconfig.tsbuildinfo`, `node_modules/.vite/vitest/<hash>/results.json`, a Jest cache, `.turbo/`, `.next/` — none of them a file the implementer's own diff touched.
+
+**Cause:** the before-image snapshot (`preexisting/<id>.txt`) is taken after `provision_command` runs but **before the test floor ever runs** in the fresh worktree. If your floor is the first thing to create that path (e.g. `tsc --noEmit` with `"incremental": true` in `tsconfig.json`, or a Vitest/Jest run seeding its cache), the snapshot never saw it, and the gate attributes it to the job like any other new gitignored write.
+
+**Fix, either of:**
+- Declare it in the manifest: `toolchain_artifacts: ["tsconfig.tsbuildinfo", "node_modules/.vite/**"]` (top level, alongside `provision_command`). The gate subtracts a matching path only when `git check-ignore` confirms it is actually gitignored at gate time — a tracked file, or `.env`/`dist/` left off the list, is still caught. See `skills/compound-v/execution-manifest.md` § `toolchain_artifacts`.
+- Or warm the artifact inside `provision_command` so it already exists when the snapshot is taken, e.g. `npm ci && npx tsc --noEmit || true && npx vitest run <one fast test> || true`. No manifest schema change needed; this is the older workaround and still works.
+
 ## `validate-manifest.py` rejects the manifest before dispatch
 
 **Symptom:** `partition-reviewer` fails (or `/v:dispatch` halts) with a manifest-invariant violation — e.g. overlapping `write_allowed`, a Codex job without `isolation: worktree`, or a reviewer not on Opus.
@@ -167,6 +177,14 @@ Re-run the validator (or `/v:dispatch`) until it's clean. The manifest schema + 
 - Resume also gates integration: it runs `scripts/compound-v-integration-gate.py` before any job commit is integrated, so **do not remove a job's worktree before resuming** — a missing receipt is *re-derived* from the tree, and a removed worktree makes the job `unverifiable` instead.
 - A run dispatched **before** 3.0's cutover has no `baseline`, no `lane-map.json` and no receipts. That resumes fine: every field Engine C adds is optional on read, and each such job simply takes the re-derivation branch.
 - If you don't know the run-id, list `docs/superpowers/execution/` — each subdirectory is a run.
+
+## After re-running `/v:dispatch` on a halted run, the gate lists `manifest.yaml`, `state.json`, `dispatch.workflow.js`, `results/…` as violations
+
+**Symptom:** you re-ran `/v:dispatch` (not `/v:resume`) on the same run-id after a halt, and the gate now BLOCKS a job whose own lane files were fine, citing the run directory's own bookkeeping — `manifest.yaml`, `dispatch.workflow.js`, `state.json`, `results/<id>.json`, `preexisting/<id>.txt` — as out-of-lane writes.
+
+**Cause:** the job's `baseline` was pinned once, at the first attempt, and a bare re-dispatch branches the new worktree from the current `HEAD` while the gate still diffs against that first pin — so every commit the pipeline made to the run directory between attempts (including the previous attempt's own record-keeping) reads as a write this attempt made. This is finding 146 (2026-09-03), reached through a door `/v:resume` does not guard.
+
+**Fix:** fixed in 3.6.3 for `worktree` jobs — `register-lane` now detects a concluded previous attempt (a receipt or result already on disk for the job) and re-pins `baseline` to the fresh worktree's `HEAD` before re-registering, so this no longer happens on a plain re-dispatch. For a `direct` job the pin still does not clear itself; run [`/v:resume <run-id>`](commands/v-resume.md) instead, which calls `resume-prepare` to clear it. See `skills/compound-v/state-machine.md` § `baseline` re-pins on a re-attempt.
 
 ## Engine C didn't run — the dispatch fell back to the subagent path
 

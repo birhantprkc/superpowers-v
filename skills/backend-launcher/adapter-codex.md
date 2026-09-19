@@ -261,3 +261,10 @@ identically across all four external workers. This is the codex-specific invocat
   `--json` event stream, no `session_id`.
 - `--provision-command` is optional. Omit it and this worker's behaviour is unchanged from
   before v3.6 — no provisioning step, no `--preexisting` snapshot, no new timing.
+- **`--toolchain-artifact <glob>` (v3.6.3, repeatable)** is the manifest's `toolchain_artifacts`
+  list, one flag per glob, forwarded to the scope gate unchanged. It is a second, distinct
+  exemption from `--preexisting`: `--preexisting` forgives what provisioning wrote *before* codex
+  starts, while `--toolchain-artifact` forgives a matching gitignored path the test floor writes
+  *during* the job (`tsconfig.tsbuildinfo`, a vitest/jest cache) — subtracted only when `git
+  check-ignore` confirms it is actually gitignored in the gated tree. See
+  [`SKILL.md`](SKILL.md#provisioning----provision-command----provision-timeout-sec-v36).

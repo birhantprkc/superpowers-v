@@ -75,7 +75,12 @@ The execution tail is a small, deterministic orchestrator — contracts + helper
   counted as a write the job made. The ordering is the whole safety argument: the snapshot is taken after
   provisioning and before the model starts, so it can only ever contain what provisioning created. A path that
   cannot be represented on one line (a filename containing a newline) is left out and is therefore never exempt.
-  The command must be idempotent and must not modify tracked files.
+  The command must be idempotent and must not modify tracked files. A separate gap: `provision_command`'s
+  snapshot is taken before the test floor ever runs, so a floor that writes its own build artifact on first
+  run (`tsconfig.tsbuildinfo`, a vitest/jest cache, `.turbo/`, `.next/`) is charged to the job the same way.
+  `toolchain_artifacts` (3.6.3) is the declared fix — a top-level list of globs, distinct from `write_allowed`,
+  subtracted from a job's violations only when `git check-ignore` confirms the path is gitignored in the gated
+  tree at gate time; a catch-all glob is rejected, so `.env` and `dist/` stay caught unless explicitly listed.
 - **Scope gate:** `scripts/compound-v-scope-check.py` unions three probes — `git diff --name-only` against the
   job's baseline, `git ls-files --others --exclude-standard`, and the same with `--ignored` — then subtracts
   exactly one list, the `--preexisting` snapshot, and tests every remaining path against `write_allowed`. It

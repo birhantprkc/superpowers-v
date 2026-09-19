@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.6.3] - 2026-09-19
+
+### Fixed — the gate charged a job for its own test run, and for the run that came before it (issue #22)
+
+A downstream TypeScript project reported that **every job whose test floor ran `tsc --noEmit` and
+`vitest run` was BLOCKED**, on all three dispatch attempts, while the implementer's own lane files
+were in lane every time. The violation list held two kinds of path, and they turned out to be two
+different defects.
+
+**1. Build artifacts the floor writes on first run.** `tsconfig.tsbuildinfo` (from `tsc` with
+`"incremental": true`) and `node_modules/.vite/vitest/<hash>/results.json` did not exist when the
+before-image was photographed — that happens after `provision_command`, before the floor has ever
+run in the fresh worktree — so the floor created them mid-job and the gate, which counts every new
+gitignored path by design, attributed them to the job. `write_allowed` cannot carry them: it must be
+disjoint across jobs, and a toolchain artifact belongs to no one job.
+
+The manifest gains a top-level **`toolchain_artifacts: [<glob>, ...]`**, separate from `write_allowed`
+and applied to every job in the run. The gate subtracts a matching path **only if `git check-ignore`
+confirms it is gitignored in the gated tree at gate time** — a tracked file, or an untracked file that
+is not actually ignored, is never forgiven by this list, so `.env` and `dist/` are still caught unless
+a human explicitly lists them in the reviewed manifest, and a worker that widens `.gitignore` to
+qualify has made a tracked change the gate sees. The validator rejects a catch-all glob. What was
+forgiven is reported on the receipt as `toolchain_artifacts`, distinct from `changed`. The four
+external worker scripts accept the same list as a repeatable `--toolchain-artifact <glob>` flag. The
+reporter's workaround — warming the artifacts inside `provision_command` — still works and is documented
+beside the new key, as they asked.
+
+**2. The run directory's own bookkeeping, from the attempt before.** `manifest.yaml`,
+`dispatch.workflow.js`, `state.json`, `results/<id>.json` and `preexisting/<id>.txt` were charged to the
+job on attempt 3. The reporter could not reproduce this half; the cause is in the code. `register-lane`
+pins a job's baseline once and never rewrites it, and only `resume-prepare` — called by `/v:resume` —
+clears it. A hand re-run of `/v:dispatch` on the same run directory does not, so the new worktree
+branched from the current HEAD while the gate diffed it against the first attempt's pin: every commit
+the pipeline itself made to the run directory between attempts read as this job's write. That is
+finding 146 (2026-09-03, `commands/v-resume.md`) reaching the gate through a door `/v:resume` does not
+guard.
+
+For a **worktree** job, `register-lane` now recognises a concluded previous attempt — a gate receipt or
+a Record result already exists for the job and it is not `merged.integrated` — and treats the
+registration as a new attempt: it archives the old receipt as `receipts/<id>.gate.superseded-<tag>.json`
+(the convention `resume-prepare` already used, now shared code), drops the stale pin and the stale
+before-image so `provision_command` re-runs and re-photographs the fresh tree, and pins the new worktree's
+HEAD. The signal is pipeline-written, never the worker's word, so the one-shot rule that stops a worker
+from re-registering after committing is intact. A **direct** job re-pins nothing — a direct worker can
+write anywhere in the checkout, including a forged result — and its ack now carries a stale-pin warning
+naming `resume-prepare`.
+
+Selftests cover both: the gitignore-verified subtraction and its four refusals (tracked, plain-untracked,
+unmatched glob, catch-all), the receipt field, the worker flag end-to-end with an anti-vacuity twin, the
+worktree re-pin, the same-attempt re-register that must NOT re-pin, the integrated job that is left
+alone, and the direct-mode warning.
+
+**Not fixed, and said so.** The reporter also saw a `direct` wave-0 job whose Gate stage carried an empty
+`--worktree` and exited 2 before writing a receipt. Neither of us can see the path in the emitted script
+that produces it, and there is no receipt to read; it stays unconfirmed.
+
 ## [3.6.2] - 2026-09-12
 
 ### Fixed — the library auditor was told it had no tools, so it never looked for them

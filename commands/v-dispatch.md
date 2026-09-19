@@ -20,6 +20,15 @@ delegating, the epic inherits Engine C along with everything else.
 | a **manifest path** (`…/execution/<run-id>/manifest.yaml`) | dispatch it directly (already materialized). |
 | a **run-id** (a dir name under `docs/superpowers/execution/`) | resolve to that run's `manifest.yaml` and dispatch directly. |
 
+**Re-dispatching a halted run (v3.6.3).** Running `/v:dispatch` again on a run-id or manifest path
+that already halted is not the same thing as `/v:resume`, but a `worktree` job now re-pins itself
+safely either way: `register-lane` detects the concluded previous attempt (a receipt or result
+already on disk) and re-baselines against the fresh worktree's `HEAD` before re-registering, so the
+bookkeeping this pipeline committed between attempts is no longer charged to the job (see
+[`state-machine.md`](../skills/compound-v/state-machine.md) § `baseline` re-pins on a re-attempt).
+A `direct` job does **not** re-pin automatically — it still needs [`/v:resume <run-id>`](v-resume.md),
+which is the only path that clears its stale pin.
+
 ## Resolving the plugin root
 
 The `scripts/` and `schemas/` this command calls ship with the plugin — they are not files in

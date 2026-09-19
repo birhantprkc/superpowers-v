@@ -41,6 +41,7 @@ of this repo.
 | `global_constraints` | string[] | no | v3.4.17: the plan's `## Global Constraints` lines, verbatim. [§ below](#the-two-superpowers-620-plan-fields-v3417). |
 | `provision_command` | string | no | v3.6: one dependency install a worktree job runs before its own before-image is taken (e.g. `npm ci`). Non-empty, single-line. See [§ `provision_command` — the dependency install that runs before the before-image](#provision_command--the-dependency-install-that-runs-before-the-before-image-v36) below. |
 | `provision_timeout_s` | integer | no | v3.6: seconds `provision_command` gets. Integer `1..1800` (a bool is rejected). **Absent ⇒ 600.** Same section below. |
+| `toolchain_artifacts` | string[] | no | v3.6.3: globs (same semantics as `write_allowed`) naming build artifacts the test floor itself writes on first run (`tsconfig.tsbuildinfo`, a vitest/jest cache, `.turbo/`, `.next/`). Subtracted from a job's violations only when `git check-ignore` confirms the path is gitignored at gate time. A catch-all glob is rejected. Applies to every job in the run — separate from `write_allowed` so disjointness is untouched. See [§ `toolchain_artifacts` — build artifacts the test floor writes](#toolchain_artifacts--build-artifacts-the-test-floor-writes-v363) below. |
 
 **`{path}` substitution is the contract, not an illustration.** Inside a rule's `run`, the literal token `{path}` is replaced by the changed path that matched the rule's `when` glob, once per matching path. It appeared only inside examples until now, so an implementer had to infer it; a rule whose `run` omits `{path}` is still valid and simply runs once per match.
 
@@ -218,6 +219,12 @@ This is the **only** way provisioning is subtracted. Nothing is forgiven by exte
 name: a job with no `provision_command` that installs its own `node_modules/` is BLOCKED, exactly as
 before.
 
+**If your test floor writes build artifacts** (`tsconfig.tsbuildinfo`, a vitest/jest cache, a
+`.turbo/` or `.next/` directory), declare them in [`toolchain_artifacts`](#toolchain_artifacts--build-artifacts-the-test-floor-writes-v363)
+— or warm them here, in `provision_command`, the same way a dependency install is warmed. The
+before-image is taken after provisioning, so any artifact the floor creates for the first time
+inside the job is otherwise attributed to the job as an out-of-lane write.
+
 **The form to write, per ecosystem.** Rule 2 is the whole safety property, and every ecosystem spells
 it differently. The obvious command is usually the wrong one: it reconciles a drifted lockfile by
 **rewriting** it, and a lockfile is a tracked file, so the before-image cannot subtract it and the job
@@ -238,6 +245,57 @@ is BLOCKED for a write it did not mean to make.
 Two npm properties worth knowing, because they generalise. `npm ci` **requires** a lockfile and errors
 without one, so a package in a subdirectory needs `cd sub && npm ci` — `/bin/bash -c` supports it. And
 it removes an existing `node_modules/` before installing, which is what makes it idempotent.
+
+---
+
+### `toolchain_artifacts` — build artifacts the test floor writes (v3.6.3)
+
+**The same before-image ordering that makes `provision_command` safe creates a second gap.**
+`preexisting/<id>.txt` is photographed after `provision_command` runs but **before the test floor
+ever runs** in the fresh worktree. A floor that writes build artifacts on its first run —
+`tsconfig.tsbuildinfo` from `tsc` with `"incremental": true`, `node_modules/.vite/vitest/<hash>/results.json`
+from Vitest, a `.turbo/` or `.next/` directory, a Jest cache — creates paths the snapshot never
+saw. The gate, which counts every new gitignored path by design (a worker must not be able to
+quietly write `.env` or `dist/` and have it forgiven), attributes those paths to the job as
+out-of-lane writes. `write_allowed` cannot carry them, because `write_allowed` must stay disjoint
+across jobs and a toolchain artifact is not owned by any one job.
+
+`toolchain_artifacts` is the declared exemption for exactly that case:
+
+```yaml
+# top level of manifest.yaml, alongside provision_command
+toolchain_artifacts:
+  - "tsconfig.tsbuildinfo"
+  - "node_modules/.vite/**"
+```
+
+**What is subtracted, and the rule that keeps it narrow.** At gate time, a changed path is removed
+from `changed` (and reported separately, see below) only if BOTH hold: it matches one of these
+globs (same semantics as `write_allowed` — `*` does not cross `/`, `**` does), AND `git
+check-ignore` confirms it is gitignored in the gated tree at that moment. A tracked file is never
+forgiven by this list, no matter how it is spelled, and neither is an untracked file that isn't
+actually gitignored — so `.env` and `dist/` are still caught unless a human explicitly lists them
+here, which is a decision this mechanism makes visible, not one it makes silently. Nor can a worker
+widen the ignore set to qualify: `.gitignore` is a tracked file, so editing it is a tracked change against
+the baseline and is gated like any other write. The gate reports
+every path it forgave this way as `toolchain_artifacts` (a list) in its JSON output, distinct from
+`violations` and from the `preexisting` subtraction.
+
+**Validator rules.** `toolchain_artifacts` is optional. When present it must be a list of
+non-empty, single-line strings. A catch-all glob (`*`, `**`, `**/*`) is rejected — that would
+forgive every gitignored path in the tree, which defeats the gate's purpose rather than closing a
+narrow gap in it.
+
+**External worker scripts** receive the list as a repeatable `--toolchain-artifact <glob>` flag
+(one per glob), passed through to the scope gate unchanged — see
+[`backend-launcher/SKILL.md`](../backend-launcher/SKILL.md).
+
+**The old alternative still works and needs no manifest change:** warm the artifacts inside
+`provision_command` so they already exist when the snapshot is taken (the workaround that
+motivated this section — `npm ci && npx tsc --noEmit || true && npx vitest run … || true`).
+`toolchain_artifacts` is for the case where warming the floor's own cache inside provisioning is
+impractical (a slow full test run, or an artifact whose path is only known after the first real
+invocation).
 
 ---
 
@@ -449,7 +507,7 @@ The scope gate reads a **repo-wide** `git diff`, so per-job attribution requires
 
 ### `direct` mode assumes a clean-ish tree — prefer `worktree` for anything untrusted
 
-`isolation: direct` gates against a pre-dispatch baseline commit **minus** a `--preexisting` snapshot of untracked/ignored paths that existed before the job (so a normal dirty tree does not produce false BLOCKs). That subtraction has an inherent blind spot: a job that **MODIFIES a pre-existing untracked or ignored file** — one already in the `--preexisting` snapshot — is **not flagged**, because the path is subtracted from the changed set whether the job touched it or not. The gate is exact only for *tracked* files (caught by the baseline diff) and *newly created* untracked/ignored files (not in the snapshot).
+`isolation: direct` gates against a pre-dispatch baseline commit **minus** a `--preexisting` snapshot of untracked/ignored paths that existed before the job (so a normal dirty tree does not produce false BLOCKs). That subtraction has an inherent blind spot: a job that **MODIFIES a pre-existing untracked or ignored file** — one already in the `--preexisting` snapshot — is **not flagged**, because the path is subtracted from the changed set whether the job touched it or not. The gate is exact only for *tracked* files (caught by the baseline diff) and *newly created* untracked/ignored files (not in the snapshot). `toolchain_artifacts` subtraction is unaffected by this blind spot — it is a separate, gitignore-verified check applied on top, in both isolation modes.
 
 So **`isolation: worktree` is the safe default for anything untrusted or run on a dirty tree.** A fresh `worktree add HEAD` has **no** pre-existing untracked/ignored files, so nothing is subtracted and the gate is exact — every write, including a modification to a would-be-ignored path, is attributed. `direct` remains **serial-only** (invariant 7) and is intended for **trusted, clean-tree** jobs where the speed of writing in place outweighs the blind spot. When in doubt, route the job to `worktree`.
 

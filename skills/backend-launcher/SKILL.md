@@ -221,6 +221,18 @@ it against missing dependencies would spend real model time arriving at a failur
 nobody anything. `--provision-command` is optional; omit it and no worker's behaviour changes
 (no provisioning step runs, and nothing about the existing flag set or timing shifts).
 
+**`--toolchain-artifact <glob>` (v3.6.3, repeatable).** A manifest's top-level `toolchain_artifacts`
+list (see [`execution-manifest.md`](../compound-v/execution-manifest.md#toolchain_artifacts--build-artifacts-the-test-floor-writes-v363))
+reaches each of the four worker scripts as this flag, once per glob, passed through to
+[`compound-v-scope-check.py`](../../scripts/compound-v-scope-check.py) unchanged. It is a
+declared exemption for build artifacts the test floor itself writes on first run
+(`tsconfig.tsbuildinfo`, a vitest/jest cache, `.turbo/`, `.next/`) — distinct from
+`--provision-command`, which runs before the model starts; a toolchain artifact can appear only
+after the floor runs, which is typically inside the job. The same check-ignore rule applies here
+as at the manifest level: the gate subtracts a matching path only when `git check-ignore` confirms
+it is gitignored in the gated tree at gate time, so a tracked file or a genuinely untracked file is
+never forgiven by this flag.
+
 ---
 
 ## `gate_receipt` — the receipt, not the authority (v3.0, Feature D1)
