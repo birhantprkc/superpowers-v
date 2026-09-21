@@ -389,3 +389,25 @@ Compound V is overkill for:
 - Solo learning sessions
 
 Fall back to default Superpowers for those. Document the fallback at the top of the plan: `"Compound V skipped — single-file feature; using default subagent-driven-development."`
+
+## A running Engine C job is reported `STALE` while the session is waiting out a usage limit
+
+**Symptom:** `/v:status` or the liveness sweep marks a job `STALE` (no progress for 600 s) and the reason ends in `PAUSED?`, while `/workflows` shows the run waiting for a usage-limit reset.
+
+**Cause:** since Claude Code 2.1.271 the Workflow runtime *pauses* a run whose agent hit the claude.ai usage limit instead of failing it — in an interactive, subscription-signed-in session with `autoContinueAtUsageLimit` on, when the reset is within 24 h and the run has not already waited twice. Nothing on disk records the pause, so a filesystem/git liveness probe cannot tell it from a hang.
+
+**Fix:** none needed — read the `/workflows` header for the reset time and let it continue. The `PAUSED?` hint (3.7.0) is added only on Engine C runs (`dispatch.workflow.js` or `lane-map.json` present in the run dir). In `claude -p`, a background session, Remote Control or an agent-team teammate the run never pauses: the affected agent fails and the emitted script's retry/escalation ladder handles it, so a `STALE` there is a real timeout.
+
+## The in-flight lane watch never reports a Bash write (`sed -i`, `tee`, codegen)
+
+**Symptom:** `compound-v-transcript-watch.py` reports `Write`/`Edit` lane violations in flight but a Bash command that rewrote a file outside the lane is only caught by the scope gate at job end.
+
+**Cause:** the watcher can only read what the transcript carries. A Bash result carries the list of files the command changed only when the native `bashEditDiffEnabled` setting is on (Claude Code ≥ 2.1.269, public beta, **user or managed scope only** — a project `.claude/settings.json` cannot turn it on).
+
+**Fix:** set `"bashEditDiffEnabled": true` in `~/.claude/settings.json` (`/v:init` Step 4f offers the edit). The parser in 3.7.0 targets the documented `bashEditDiff` shape (`changedFiles`, `files[].filePath`) and is marked unverified-live in the source until a probe on a signed-in install confirms where the field lands in the transcript; without the setting the watch is still blind to Bash writes its command text does not name.
+
+## `claude plugin eval .` refuses to start in this checkout
+
+**Symptom:** `a plugin directory holds more than 20000 entries`, `Not logged in · Please run /login`, or a Bash-sandbox refusal naming a symbolic link under `~/.docker`.
+
+**Cause and fix:** (1) stale `.claude/worktrees/` from earlier pipeline runs push the checkout over the eval harness's 20 000-entry scan limit — `git worktree list` and remove the ones with no commits ahead of `main`, or run the suite from a copy without `.git/` and `.claude/worktrees/`; (2) the CLI must be signed in (`claude auth status`) — a desktop-app session's login does not carry over to a nested `claude` process; (3) `find ~/.docker -type l` names the link the sandbox refuses; the harness documents this precondition nowhere, so it is recorded here.

@@ -110,6 +110,8 @@ The triage gate is on by default. It is exempt on `docs/superpowers/**`, fires a
 - **Marathon mode is still not fire-and-forget.** It drops the checkpoint and adds an arbiter panel, a blocker ledger and breakers, but after a hard death you re-run `/v:epic <epic-id>` yourself.
 
 ## Verification program
+
+**Native evals (3.7.0).** `evals/` is a `claude plugin eval` suite — seven cases on scaffolded fixture repos, graded mostly by regex over the real validator and scope-gate output, with a no-plugin baseline arm. It is a release gate a signed-in human runs (`claude plugin eval . --runs 1 --scaffold --allow-tools Bash Write Edit --threshold 0.8`), not a CI step; `evals/README.md` keeps the last real scores, and until one is recorded there no eval number exists.
 Compound V is dogfooded against its own claims in eight staged cycles, each run against native Claude Code mechanisms rather than trusted from prose. Every cycle's review is recorded in
 [docs/superpowers/dogfood/README.md](docs/superpowers/dogfood/README.md) — a generated index whose footer carries the tally (56 reviews, 11 APPROVED as this was written).
 

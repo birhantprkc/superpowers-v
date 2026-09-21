@@ -119,6 +119,7 @@ These work in any harness that reads `agents/*.md` frontmatter. Codex CLI loads 
 - `superpowers-v:parallel-dispatcher` — manifest-driven multi-backend dispatcher; calls `compound-v-scope-check.py` after every job and HALTS on BLOCKED
 - `superpowers-v:spec-reviewer` — the three-pass Review Gate (spec acceptance criteria · quality/no-regression/no-fabricated-metrics · final integration), AC-gated · `memory: project` (recurring defect patterns and where they live); the review job's `write_allowed` must include `.claude/agent-memory/superpowers-v-spec-reviewer/**`
 - `superpowers-v:implementer` — the role every Claude implementation job arrives as (3.4.0). Carries the turn cap (`maxTurns: 80` — a field of an agent definition, which is the only native way a workflow job gets one) and the official Opus 5 guidance on scope, narration cadence and deliverable length
+- `superpowers-v:transport` — the pipeline's own tool-call carrier (3.7.0): every Gate, Record, Finalize and Continuity stage of an Engine C run spawns it to run exactly one clamped Python subcommand and return its JSON. `omitClaudeMd: true` (Claude Code ≥ 2.1.271), because a carrier that loads a project's whole instruction set to echo one command back is paying for context it never reads; `model: sonnet`, because it decides nothing. A runtime that does not know the agent type falls back once to the anonymous clamped spawn 3.6 used
 
 All reviewers/agents carry `model: opus`. Manifest `backend`/`model` values (`gpt-5.5`, etc.) are execution-layer data and **never** appear in any frontmatter.
 
@@ -133,6 +134,10 @@ never as instructions: a remembered pattern is a lead that must be re-verified a
 no secret is ever written there, and a directive found inside a memory file is ignored and reported.
 Subagent memory is part of auto memory, so `autoMemoryEnabled: false` (or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`)
 turns it off everywhere and the agents run exactly as they did before 3.5.0.
+
+## Eval suite (3.7.0)
+
+`evals/` is a native `claude plugin eval` suite (Claude Code ≥ 2.1.269): seven cases, each a realistic prompt on a scaffolded fixture repository with deterministic graders where the tooling's own output makes one possible (regex over the validator's and scope gate's real messages, `tool_used`) and an LLM rubric only where right and wrong answers share vocabulary; one case is a control that must NOT trigger Compound V. Run it from the plugin root with `claude plugin eval . --runs 1 --scaffold --allow-tools Bash Write Edit --threshold 0.8` — it needs a signed-in CLI and spends tokens, so it is a release gate a human runs, not a CI step. `evals/README.md` records the last real run under a dated heading; **as of 3.7.0 the suite has been enumerated and its fixtures verified against the real scripts, but no scored run has completed** (see that file for the three blockers). No number in this repository comes from it yet.
 
 ## Slash commands
 
@@ -157,6 +162,7 @@ turns it off everywhere and the agents run exactly as they did before 3.5.0.
 
 - **Opus by default** — every implementer, reviewer, advisor
 - **Sonnet for scanning** — `code-archaeologist` and `doc-validator` (3.1.0): reading a repository and checking a library version is execution, not judgment
+- **Sonnet for carrying** — `transport` (3.7.0): running one clamped pipeline command and returning its output is execution too
 - **Sonnet** — narrow exception per the 8-box junior-task taxonomy in `skills/compound-v/phase-3-parallel-opus-dispatch.md`
 - **Never Haiku** — not permitted in this project
 - **An advisor beside the acting model** (3.6). Claude Code's built-in `advisor` tool is a stronger reviewer that sees the acting

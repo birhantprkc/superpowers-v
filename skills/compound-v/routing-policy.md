@@ -371,6 +371,31 @@ fields and [adapter-codex](../backend-launcher/adapter-codex.md) /
 [adapter-claude](../backend-launcher/adapter-claude.md) for per-backend effort
 handling.
 
+**The `maxEffortLevel` cap (Claude Code 2.1.267+).** `maxEffortLevel` is a native Claude
+Code setting — top-level, or per model under `modelSettings.<model>.maxEffortLevel` —
+that "cap[s] the effort level a session can use," and "[w]hen several scopes set a cap,
+the lowest applies, so a cap set in one scope can't be raised from another"
+([settings reference](https://code.claude.com/docs/en/settings-reference#maxeffortlevel)).
+A manifest routes `backend: claude` jobs with an `effort` the routing table below
+picked, but if the project's or the user's own settings cap that model below it, Claude
+Code silently runs the job at the cap — the manifest would record an effort that never
+ran. For **`backend: claude` only**, `compound-v-resolve-model.py`'s CLI now reads (read-only)
+`.claude/settings.json`, `.claude/settings.local.json`, and `~/.claude/settings.json`
+(overridable with `CLAUDE_CONFIG_DIR`), computes the effective per-model cap per file — a
+matching `modelSettings.<model>.maxEffortLevel` **replaces**, not intersects, that file's
+own top-level `maxEffortLevel` — takes the LOWEST cap across the three files, and if the
+requested effort ranks above it, lowers `effort` to the cap and adds
+`"effort_capped": {"requested": ..., "cap": ..., "source": "<file>"}` (`null` when
+nothing capped it). The effort ladder is `low < medium < high < xhigh < max` (`max` is a
+cap-only sentinel meaning "no cap"; it is never a value this resolver's own `--effort`
+accepts). This never affects a non-`claude` backend — `maxEffortLevel` is a Claude Code
+client setting with no meaning for a codex/antigravity/cursor/opencode worker process.
+Two honest limits: matching a settings file's `modelSettings` key to this resolver's own
+alias (`opus`/`sonnet`/`fable`) is a **best-effort** exact-or-segment match, not Claude
+Code's own internal alias/canonical-id table; and organization-**managed** settings (a
+separate OS-specific path) are invisible to this script but still apply at runtime, so
+`effort_capped: null` here does not guarantee the job actually ran uncapped.
+
 ---
 
 ## Env-aware Claude-only fallback

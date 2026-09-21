@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-09-21
+
+### Added — five native Claude Code mechanisms from the 2.1.261–2.1.278 changelogs, taken where they replace something we did by hand
+
+A pass over one month of Claude Code releases against this repository, adopted in one release. Everything
+below is **documented, not probed**: the CLI on the development machine was 2.1.263 when the work started
+and was updated to 2.1.278 during it, but a nested `claude` process in that session had no login, so no
+behaviour that needs a live model call was exercised. Each item says what was verified instead.
+
+**A native eval suite — `evals/` (`claude plugin eval`, ≥ 2.1.269).** This repository has said since 3.0
+that it carries no measurement harness. It now carries the native one: seven cases, each a realistic
+prompt on a scaffolded fixture repository, graded by regex over the validator's and scope gate's real
+output where the tooling makes that possible (the overlap manifest yields exactly one violation naming
+both jobs; the scope fixture yields `BLOCKED: 2 file(s)` naming both paths; the triage fixture scores
+`DIRECT`), by `tool_used` for "did it run the validator", and by an LLM rubric only where right and
+wrong answers share vocabulary. One case is a control that must **not** trigger Compound V. All seven
+enumerate without load errors and every scaffold runs clean. **No scored run has completed** — three
+blockers on this machine are recorded in `evals/README.md` and TROUBLESHOOTING (no CLI login; stale
+worktrees pushing the checkout past the harness's 20 000-entry limit; a `~/.docker` symlink the Bash
+sandbox refuses). The suite is a release gate a signed-in human runs, not a CI step, and no number in
+this repository comes from it yet.
+
+**In-flight Bash writes reach the lane watch (`bashEditDiffEnabled`, ≥ 2.1.269, beta).** The transcript
+watch could only attribute `Write`/`Edit` calls; a `sed -i` or a codegen script was invisible until the
+gate at job end. A Bash result now carries the files the command changed when the native setting is on,
+and `compound-v-transcript-watch.py` feeds `bashEditDiff.changedFiles` / `files[].filePath` through the
+same lane matcher, tagged `Bash`. The setting is user- or managed-scope only (a project file cannot turn
+it on) and the field is public beta, so the parser is marked unverified-live in the source until a probe
+on a signed-in install shows where the field lands. Five new rows in `tests/test-transcript-watch.sh`
+(55 → 60), including "no diff ⇒ byte-identical report".
+
+**The runtime's concurrency cap and its usage-limit pause, stated where they bite.** The Workflow runtime
+runs at most 16 agents at once by default (`CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS`, 1–256,
+≥ 2.1.269). Engine C chains Implement → Gate → Record per job, so a wave of W jobs holds W slots and no
+more — derived from the emitted script, not guessed. The validator now raises the advisory
+`WARN: WAVE_EXCEEDS_RUNTIME_CONCURRENCY` for a wave wider than 16 (verdict unchanged), the partition
+reviewer lists it, and `/v:dispatch` says when to export the variable. Since 2.1.271 a run whose agent
+hits the claude.ai usage limit *pauses* in an interactive subscription session with
+`autoContinueAtUsageLimit` on — and looks exactly like a hang to a filesystem liveness probe. The liveness
+sweep now appends `PAUSED?` and an `attention_hint` to a `STALE` verdict on an Engine C run, pointing at
+the `/workflows` header; it detects nothing, because nothing on disk records the pause, and says so. In
+`claude -p`, a background session or Remote Control the run never pauses — the agent fails and the
+retry/escalation ladder is what catches it; `failure-policy.md` now draws that line.
+
+**Fewer turns spent on plumbing.** A 3.6.0 documentation job hit the 80-turn cap three times re-reading
+Bash output that had spilled to a file. `/v:init` Step 4f offers `bashOutputMaxChars` (≥ 2.1.261, clamped
+4 000–128 000; 100 000 suggested) in the project settings — and says plainly that `taskOutputMaxChars`
+is inert on 2.1.277+, where `TaskOutput` was removed. The four transport stages (Gate, Record, Finalize,
+Continuity) now spawn a named `superpowers-v:transport` agent: `omitClaudeMd: true` (≥ 2.1.271), because
+a carrier that loads a project's whole instruction set to run one command and echo its JSON back pays
+for context it never reads; `model: sonnet`, named in the linter's allow-list beside the two scanning
+agents, because it decides nothing; `maxTurns: 10`, which bounds a runaway and cannot cut a two-turn
+job short. A runtime that cannot resolve the type falls back once to the anonymous clamped spawn 3.6
+used; whether a `tools:`-restricted agent type still accepts schema mode is the one thing the docs do not
+say, so the first real dispatch is that test. The transport deny-list gains `TaskCreate`/`TaskGet`/
+`TaskList`/`TaskUpdate` and `TaskStop` — the modern replacements for `TodoWrite` were not denied.
+
+**`maxEffortLevel` is read before an effort is recorded (≥ 2.1.267).** A project or user settings cap
+silently lowers the effort a job runs at; the run record would have said `high` for a job that ran at
+`medium`. `compound-v-resolve-model.py` now reads the three settings files (read-only), applies the
+documented rule — a per-model `modelSettings.<model>.maxEffortLevel` replaces the file's top-level cap,
+then the lowest cap across files wins — and for `backend: claude` reports `effort_capped:
+{requested, cap, source}` (or `null`). Model-key matching is best-effort against the resolver's own
+aliases; managed settings are invisible to it, and the docs say so. Eleven new selftest rows. Since
+2.1.277 a project with only an `AGENTS.md` is read natively; `/v:onboard` now says what the generated
+`CLAUDE.md` bridge carries that `AGENTS.md` does not, and when it is safe to drop.
+
+`scripts/lint-frontmatter.py` skips `evals/**/graders/*.md`, whose frontmatter is the eval harness's
+contract, not an agent's.
+
 ## [3.6.3] - 2026-09-19
 
 ### Fixed — the gate charged a job for its own test run, and for the run that came before it (issue #22)

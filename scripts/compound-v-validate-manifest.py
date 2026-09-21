@@ -3046,6 +3046,118 @@ def unnamespaced_agent_memory_name(glob):
     return agent
 
 
+# --------------------------------------------------------------------------- #
+# WAVE_EXCEEDS_RUNTIME_CONCURRENCY (v3.6.4) — advisory only, never a violation.
+#
+# The native Workflow runtime runs "up to 16 concurrent agents by default,
+# fewer when Claude Code has fewer CPUs available, including inside a
+# CPU-limited container"; `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` (1-256,
+# Claude Code >= 2.1.269) raises it (docs: code.claude.com/docs/en/workflows,
+# "Behavior and limits", fetched 2026-09-21).
+#
+# TRANSPORT_AGENT_HEADROOM = 0, DERIVED, not guessed — from
+# `scripts/compound-v-emit-workflow.py`'s own JS_TEMPLATE:
+#   - `pipeline(wave, implementStage, gateStage, recordStage)` (l.3493) chains
+#     the three stages PER ITEM: `gateStage(prev, job)` (l.3093) and
+#     `recordStage(verdict, job)` (l.3226) each take the PRIOR stage's awaited
+#     result, so a job is in exactly one of {Implement, Gate, Record} at a time.
+#   - Every retry path is itself a sequential `await`: `withRetry` (l.2895)
+#     loops attempts with `await fn()`, and the one-shot reviewer escalation in
+#     `implementStage` (l.3013-3031) `await`s its lifted attempt after the
+#     first has already exhausted — never alongside it.
+#   - `register-lane` is NOT a spawned agent: it is the Implement agent's own
+#     FIRST BASH COMMAND (l.2592), run inside that same agent, not a second one.
+#   - `alreadyIntegratedIds()` (the one-off Continuity agent) runs ONCE, before
+#     wave 0 (l.3466); `finalizeWave` runs once per wave, AFTER `pipeline()` has
+#     already resolved (l.3538 `await pipeline(...)`, l.3538+ `await
+#     finalizeWave(...)`). Neither overlaps a wave's own job agents.
+#   - `IMPLEMENT_DISALLOWED` (l.205) denies `Task`/`Agent` to every implementer,
+#     so a job cannot fan out a nested agent that would add to the count either.
+# So the emitter's own peak concurrent-agent count for a wave of W jobs is
+# exactly W — never a multiple of it — and the runtime's 16-agent default
+# applies to wave WIDTH directly, with no headroom to subtract.
+RUNTIME_CONCURRENCY_DEFAULT = 16
+TRANSPORT_AGENT_HEADROOM = 0
+
+
+def _emit_workflow_module():
+    """Load ``compound-v-emit-workflow.py``'s ``topo_waves`` by path (read-only
+    sibling reuse, the pattern this project already uses elsewhere — e.g.
+    ``compound-v-classify-request.py``'s ``_resolve_model_module``) so the
+    WAVE_EXCEEDS_RUNTIME_CONCURRENCY advisory groups jobs into EXACTLY the
+    waves Engine C would dispatch, instead of forking a second copy of that
+    grouping algorithm. Cached after the first load. ``None`` on any failure —
+    degrade-safe, same as every other advisory: the hard invariant checks above
+    already own dangling-ref/cycle/type problems, so a wave computation that
+    cannot run here costs nothing but this one extra hint.
+    """
+    global _EMIT_WORKFLOW_MODULE
+    if _EMIT_WORKFLOW_MODULE is not None:
+        return _EMIT_WORKFLOW_MODULE
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "compound-v-emit-workflow.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_cv_emit_workflow_wavecheck", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _EMIT_WORKFLOW_MODULE = mod
+        return mod
+    except Exception:  # noqa: BLE001 — never let this sink the whole validator
+        return None
+
+
+_EMIT_WORKFLOW_MODULE = None
+
+
+def wave_concurrency_advisories(manifest):
+    """Return WAVE_EXCEEDS_RUNTIME_CONCURRENCY advisory strings — never
+    violations, never verdict-changing (see the module docstring at the top of
+    the ADVISORIES section). Fires when a dependency wave `topo_waves()` would
+    actually dispatch has more jobs than
+    ``RUNTIME_CONCURRENCY_DEFAULT - TRANSPORT_AGENT_HEADROOM`` (16 - 0 = 16
+    today). Silent (returns []) on anything that isn't a clean, already-valid
+    DAG with an int ``max_parallel`` — the hard checks above own a dangling
+    ref, a cycle, or a malformed field, and this advisory must never be the
+    thing that raises on a broken manifest.
+    """
+    out = []
+    if not isinstance(manifest, dict):
+        return out
+    jobs = manifest.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        return out
+    mp = manifest.get("max_parallel")
+    try:
+        max_parallel = int(mp)
+    except (TypeError, ValueError):
+        return out
+    mod = _emit_workflow_module()
+    if mod is None:
+        return out
+    try:
+        waves = mod.topo_waves(jobs, max_parallel)
+    except Exception:  # noqa: BLE001 — cycles/dangling refs are reported elsewhere
+        return out
+    limit = RUNTIME_CONCURRENCY_DEFAULT - TRANSPORT_AGENT_HEADROOM
+    for idx, wave in enumerate(waves, start=1):
+        width = len(wave)
+        if width <= limit:
+            continue
+        ids = ", ".join(sorted(j.get("id") or "<no id>" for j in wave
+                               if isinstance(j, dict)))
+        out.append(
+            "wave %d (%s): %d jobs exceeds the native Workflow runtime's default "
+            "concurrency cap of %d concurrent agents — the run will queue rather "
+            "than fail, but the wave will not actually run at %d-wide unless you "
+            "raise CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS (1-256, Claude Code "
+            ">= 2.1.269) before launching"
+            % (idx, ids, width, RUNTIME_CONCURRENCY_DEFAULT, width)
+        )
+    return out
+
+
 def advisories(manifest):
     """Return a list of ADVISORY strings. Never violations; never verdict-changing.
 
@@ -3105,6 +3217,7 @@ def advisories(manifest):
             "no_work; pair the memory glob with the job's real output lane or declare "
             "write_allowed: []" % (jid,)
         )
+    out.extend(wave_concurrency_advisories(manifest))
     return out
 
 
@@ -6040,6 +6153,68 @@ def _selftest():
     expect("unnamespaced_agent_memory_name: namespaced form -> None",
            unnamespaced_agent_memory_name(
                ".claude/agent-memory/superpowers-v-spec-reviewer/**") is None)
+
+    # --- ADVISORIES: WAVE_EXCEEDS_RUNTIME_CONCURRENCY (v3.6.4) -----------------
+    # The native Workflow runtime's default cap is 16 concurrent agents, and the
+    # emitter's own peak-concurrency arithmetic (see the constant's docstring
+    # above `wave_concurrency_advisories`) is 1 agent per job in flight at a
+    # time — so a wave this wide queues rather than dispatching all at once.
+    def _wave_manifest(n_jobs, max_parallel):
+        jobs = "\n".join(
+            "  - id: task-w%d\n"
+            "    title: \"wave job %d\"\n"
+            "    type: bounded_crud\n"
+            "    backend: claude\n"
+            "    tier: standard\n"
+            "    effort: medium\n"
+            "    isolation: worktree\n"
+            "    run: parallel\n"
+            "    write_allowed: [src/wave%d/**]\n"
+            "    read_allowed: [src/**]\n"
+            "    acceptance: [\"builds\"]"
+            % (i, i, i)
+            for i in range(n_jobs)
+        )
+        return """
+run_id: 2026-09-21-wave
+feature: "wave width"
+spec_path: docs/superpowers/specs/2026-09-21-wave.md
+plan_path: docs/superpowers/plans/2026-09-21-wave.md
+audits:
+  archaeology: docs/superpowers/archaeology/2026-09-21-wave.md
+  domain: docs/superpowers/expert/2026-09-21-wave.md
+  library: docs/superpowers/library-audit/2026-09-21-wave.md
+routing_stance: balanced
+max_parallel: %d
+acceptance_criteria:
+  - "ships"
+jobs:
+%s
+""" % (max_parallel, jobs)
+
+    _wide = _wave_manifest(17, 20)
+    _wide_msgs = advisories_text(_wide)
+    expect("advisory: a 17-job single wave raises WAVE_EXCEEDS_RUNTIME_CONCURRENCY",
+           any("17 jobs exceeds" in w and "wave 1" in w for w in _wide_msgs))
+    expect("advisory: the warning names the runtime default and the env var",
+           bool(_wide_msgs) and any(
+               "concurrency cap of 16" in w
+               and "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS" in w
+               for w in _wide_msgs))
+    expect("advisory: WAVE_EXCEEDS_RUNTIME_CONCURRENCY does NOT change the verdict",
+           validate_text(_wide) == [])
+
+    _narrow = _wave_manifest(4, 4)
+    expect("advisory: a 4-job wave does NOT raise WAVE_EXCEEDS_RUNTIME_CONCURRENCY",
+           not any("exceeds" in w and "concurrency cap" in w
+                   for w in advisories_text(_narrow)))
+    expect("wave-width test manifest (4-job) is itself a clean PASS",
+           validate_text(_narrow) == [])
+
+    # exactly-at-the-limit (16) must NOT warn; one over (17) must.
+    expect("advisory: exactly 16 jobs in one wave does NOT warn",
+           not any("concurrency cap" in w
+                   for w in advisories_text(_wave_manifest(16, 20))))
 
     # --- v3.6: provision_command / provision_timeout_s -------------------------
     def _prov(extra):

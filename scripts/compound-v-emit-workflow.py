@@ -173,9 +173,28 @@ FORBIDDEN_PATTERNS = [
 # confinement that actually holds is the clamp, which is an ALLOWLIST of command
 # forms and is fail-closed ("no clamp rule matches this command" -> deny;
 # "permission check crashed" -> deny).
+#
+# `TodoWrite` plus the checklist family (native-mechanisms audit, 2.1.268/2.1.277
+# facts, verified against code.claude.com/docs/en/tools-reference and
+# /changelog on the installed 2.1.278 binary): `TaskCreate`, `TaskGet`,
+# `TaskList` and `TaskUpdate` are the CURRENT default for the same session
+# checklist `TodoWrite` used to be — "TodoWrite: disabled by default in favor
+# of TaskCreate, TaskGet, TaskList, and TaskUpdate" — and both forms are
+# offered only on Claude 3.x, Opus 4.0-4.7, Sonnet 4.0-4.6 and Haiku 4.5 by
+# default, or on any model under `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` (2.1.268).
+# `TodoWrite` alone left the modern family completely undenied on exactly the
+# model range where it is offered by default — a gap this list closes rather
+# than one it was ever meant to leave open. `TaskStop` joins them for the same
+# reason `IMPLEMENT_DISALLOWED` denies `Task`/`Agent` below: it can act on
+# ANOTHER job's running background command, a cross-job blast radius a
+# single-command transport has no legitimate reason to reach. `TaskOutput` is
+# deliberately NOT listed: the binary removed it outright in 2.1.277 ("Claude
+# reads a background task's output file with Read instead"), and a denylist
+# entry for a tool that no longer exists denies nothing.
 NARROW_DISALLOWED = [
     "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead",
     "Glob", "Grep", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop",
     "SlashCommand", "Skill", "Artifact", "ExitPlanMode",
 ]
 
@@ -826,12 +845,23 @@ def topo_waves(jobs, max_parallel):
 # IMPLEMENTER prompt: told to write inside a lane and report a summary, with
 # none of `agents/spec-reviewer.md`'s three-pass contract reaching it.
 #
-# So exactly ONE mapping is made, and only where a job's own declared type says
-# the work IS that role. The other stages stay anonymous on purpose, and the
-# reason is in the JS_TEMPLATE next to them: Gate, Record and Finalize are
-# de-tooled single-command transports whose entire safety property is
-# `disallowedTools` + `bashCommandClamp`, and every agent under agents/ declares
-# no `tools:` restriction at all.
+# So exactly ONE mapping BY JOB TYPE is made here, and only where a job's own
+# declared type says the work IS that role — this dict never grows a `gate` or
+# `record` entry, because those are not job types.
+#
+# Gate, Record, Finalize and Continuity are a SEPARATE case, resolved once per
+# run (not per job) by `resolve_role_agent_type("transport")` below and carried
+# as `CFG.transport_agent_type` — see `agentTransport` in the JS_TEMPLATE. Until
+# 3.6.4 the reason they stayed anonymous was that every agent under `agents/`
+# declared no `tools:` restriction, so spawning a de-tooled single-command
+# transport by role would have hand it back the whole toolbox — the opposite of
+# `disallowedTools` + `bashCommandClamp`. `agents/transport.md` is the fix:
+# it declares its OWN `tools: Bash, StructuredOutput`, so spawning it by role
+# ADDS a restriction (native, on top of the same `disallowedTools` +
+# `bashCommandClamp` opts these calls already carried) instead of removing one,
+# and its `omitClaudeMd: true` is the actual payoff — four spawns per job plus
+# one per wave stop loading this repository's own CLAUDE.md/AGENTS.md for an
+# agent whose entire job is "run one command and return its JSON verbatim".
 #
 # The prefix is READ from the plugin's own manifest rather than assumed. It is
 # the install's plugin name, not the checkout's directory name — this very file
@@ -893,11 +923,17 @@ def agent_role_for(job_type):
     return DEFAULT_AGENT_ROLE, None
 
 
-def resolve_agent_type(job_type, plugin_dir=None):
-    """(agent_type or None, reason). Never guesses a name."""
-    role, decline = agent_role_for(job_type)
-    if not role:
-        return None, decline
+def resolve_role_agent_type(role, plugin_dir=None):
+    """(agent_type or None, reason) for a BARE role name — no job-type mapping.
+
+    Split out of `resolve_agent_type` (3.6.4) so a fixed, non-job-scoped role
+    (`transport`, spawned uniformly by Gate/Record/Finalize/Continuity, never
+    keyed to any job's `type`) can resolve through the identical file-exists +
+    plugin-manifest-name lookup `agent_role_for` feeds `resolve_agent_type`
+    with. Never guesses a name: an agent file or a manifest name that cannot be
+    found returns `None`, and the caller stays anonymous rather than emitting
+    an `agentType` that resolves to nothing.
+    """
     root = plugin_dir or os.path.dirname(HERE)
     if not os.path.exists(os.path.join(root, "agents", "%s.md" % role)):
         return None, "no agents/%s.md under %s" % (role, root)
@@ -907,6 +943,14 @@ def resolve_agent_type(job_type, plugin_dir=None):
     if not (isinstance(name, str) and name.strip()):
         return None, "plugin manifest %s declares no name" % manifest
     return "%s:%s" % (name.strip(), role), None
+
+
+def resolve_agent_type(job_type, plugin_dir=None):
+    """(agent_type or None, reason). Never guesses a name."""
+    role, decline = agent_role_for(job_type)
+    if not role:
+        return None, decline
+    return resolve_role_agent_type(role, plugin_dir=plugin_dir)
 
 
 PLUGIN_ROOT = os.path.dirname(HERE)
@@ -2073,6 +2117,15 @@ def build_plan(manifest, run_dir, repo_root, python_bin, self_path,
     transport_model, transport_note = resolve_job_model(
         {"id": "__transport__", "backend": "claude", "tier": "light"},
         python_bin, stance=stance, config_path=config_path)
+    # `agents/transport.md` (3.6.4) — resolved ONCE per run, never per job or
+    # per stage, because Gate/Record/Finalize/Continuity are not job types and
+    # never key off a job's own `type` the way `AGENT_TYPE_BY_JOB_TYPE` does.
+    # `None` when the file or the plugin manifest name cannot be found, exactly
+    # like every other `agentType` resolution here — the JS_TEMPLATE's
+    # `agentTransport` reads `CFG.transport_agent_type` and spawns anonymously
+    # when it is falsy, so a missing definition degrades, it never breaks emit.
+    transport_agent_type, transport_agent_type_note = resolve_role_agent_type(
+        "transport")
     artefacts = {}
     max_parallel = manifest.get("max_parallel") or 4
     jobs = manifest.get("jobs") or []
@@ -2415,6 +2468,8 @@ def build_plan(manifest, run_dir, repo_root, python_bin, self_path,
         "models_config": config_path,
         "transport_model": transport_model,
         "transport_model_note": transport_note,
+        "transport_agent_type": transport_agent_type,
+        "transport_agent_type_note": transport_agent_type_note,
         # The workflow's retry budget and the escalation ladder, resolved ONCE
         # here so the emitted script never re-derives either.
         "retry": retry_config(manifest),
@@ -2949,6 +3004,51 @@ function isAgentTypeMissing(err) {
   const m = String(err && err.message ? err.message : err);
   return /agent type '[^']*' not found/i.test(m);
 }
+
+// ---------------------------------------------------------------------------
+// agentTransport — the ONE place the four clamped, single-command transports
+// (Gate, Record, Finalize, Continuity) spawn from. `agents/transport.md`
+// (3.6.4) declares `omitClaudeMd: true`, so a spawn that resolves it skips
+// loading this repository's own CLAUDE.md/AGENTS.md — real weight for an agent
+// whose entire job is "run one command and return its JSON verbatim", spent
+// four times per job plus once per wave. `CFG.transport_agent_type` is None
+// when the plugin manifest or `agents/transport.md` cannot be resolved at
+// emit-time (see `resolve_role_agent_type` in Python) — never guessed — and
+// then every call below is the plain, anonymous `agent(prompt, opts)` this file
+// ran before 3.6.4.
+//
+// On `agent type 'transport' not found` this retries ONCE with the identical
+// opts minus `agentType` — the SAME fallback `attemptImplement` already uses
+// for `implementer`/`spec-reviewer`, and the SAME anonymous shape these four
+// stages ran with in every release before this one, so a plugin update or a
+// session that never registered the agent degrades to proven behaviour rather
+// than failing the job. No other error is caught here: a transport that fails
+// for any other reason (a bad clamp, a schema/tools mismatch this repo has not
+// yet hit live) must surface as THAT stage's own failure — every one of Gate,
+// Record, Finalize and Continuity already fails closed on a thrown error (see
+// each stage's own try/catch), so the blast radius of a wrong guess here is a
+// FAIL verdict on the affected job, never a silent wrong merge.
+// ---------------------------------------------------------------------------
+let _transportFallbackLogged = false;
+async function agentTransport(prompt, opts) {
+  if (!CFG.transport_agent_type) return agent(prompt, opts);
+  const withRole = Object.assign({}, opts, { agentType: CFG.transport_agent_type });
+  try {
+    return await agent(prompt, withRole);
+  } catch (err) {
+    if (!isAgentTypeMissing(err)) throw err;
+    if (!_transportFallbackLogged) {
+      _transportFallbackLogged = true;
+      log('transport: ' + CFG.transport_agent_type + ' is not loaded in this session — ' +
+          'every remaining Gate/Record/Finalize/Continuity spawn falls back to the ' +
+          'anonymous transport (loses omitClaudeMd and the definition\'s own maxTurns; ' +
+          'disallowedTools and the bashCommandClamp are unchanged, since those come ' +
+          'from opts, not from the definition)');
+    }
+    return await agent(prompt, opts);
+  }
+}
+
 function implementFailure(job) {
   return { job: job, implement: null, retries: [], escalated_from: null,
            exhausted: false };
@@ -3195,7 +3295,7 @@ async function gateStage(prev, job) {
     };
 
     const gres = await withRetry('gate', job.id, function () {
-      return agent(prompt, opts);
+      return agentTransport(prompt, opts);
     });
     meta.retries = meta.retries.concat(gres.retries);
     if (gres.exhausted) meta.exhausted = true;
@@ -3272,7 +3372,7 @@ async function recordStage(verdict, job) {
     // they are logged and go no further — claiming them in a file this stage
     // never wrote would be the fabrication, not the omission.
     const rres = await withRetry('record', job.id, function () {
-      return agent(prompt, {
+      return agentTransport(prompt, {
       label: 'record ' + job.id,
       phase: 'Record',
       schema: RECORD_SCHEMA,
@@ -3339,7 +3439,7 @@ async function finalizeWave(waveIndex, wave) {
       cmd + '\n```\n';
 
     const fres = await withRetry('finalize', 'wave-' + (waveIndex + 1), function () {
-      return agent(prompt, {
+      return agentTransport(prompt, {
       label: 'finalize ' + title,
       phase: 'Finalize',
       schema: FINALIZE_SCHEMA,
@@ -3420,7 +3520,7 @@ async function alreadyIntegratedIds() {
     'structured result. Do not summarise it, do not re-run it, do not run ' +
     'anything else.\n\n```bash\n' + cmd + '\n```\n';
   const ires = await withRetry('continuity', 'run', function () {
-    return agent(prompt, {
+    return agentTransport(prompt, {
       label: 'already-integrated jobs',
       phase: 'Continuity',
       schema: INTEGRATED_JOBS_SCHEMA,
@@ -9074,12 +9174,46 @@ def selftest():
                "of restating the contract",
                "come from your OWN agent definition"
                in _implement_prompt(rev_entries["rev"], rev_plan))
-        _check("Gate/Record/Finalize stay anonymous — their safety IS the "
-               "narrowing, and no agent here declares a tools: restriction",
-               "phase: 'Gate'" in rev_script
-               and rev_script.count("opts.agentType") == 1
-               and "agentType" not in rev_script.split("async function gateStage", 1)[1]
-               .split("async function finalizeWave", 1)[0])
+        # --- agents/transport.md (3.6.4): the SAME native mechanism, applied to
+        # Gate/Record/Finalize/Continuity. These four are NOT job types (they
+        # never key off a manifest job's own `type` the way `review` does), so
+        # they resolve ONE run-level `CFG.transport_agent_type` through the
+        # shared `agentTransport` helper instead of a per-job `job.agent_type` —
+        # the assertion below used to read "Gate/Record/Finalize stay
+        # anonymous... no agent here declares a tools: restriction", which
+        # `agents/transport.md`'s own `tools: Bash, StructuredOutput` now makes
+        # false; this replaces it with a check on the shape that exists instead
+        # of a stale claim about the shape that used to.
+        _check("agents/transport.md exists under the plugin root",
+               os.path.exists(os.path.join(os.path.dirname(HERE),
+                                            "agents", "transport.md")))
+        _transport_expected, _transport_why = resolve_role_agent_type("transport")
+        _check("this plugin's own agents/transport.md + plugin.json resolve a "
+               "real agentType", bool(_transport_expected), str(_transport_why))
+        _check("the run-level plan carries that SAME resolved agentType as "
+               "CFG.transport_agent_type",
+               rev_plan.get("transport_agent_type") == _transport_expected)
+        _check("agentTransport is the ONE spawn path for Gate, Record, "
+               "Finalize and Continuity, called at exactly its four call "
+               "sites — never a fifth, and never plain agent(prompt, opts) "
+               "for one of these four phases",
+               "async function agentTransport(prompt, opts)" in rev_script
+               and rev_script.count("return agentTransport(prompt") == 4
+               and rev_script.count("async function agentTransport") == 1)
+        _check("agentTransport reads the RUN-LEVEL CFG.transport_agent_type, "
+               "never a per-job job.agent_type — that field is Implement's "
+               "alone, set only where a job's own `type` maps to a role",
+               "CFG.transport_agent_type" in rev_script.split(
+                   "async function agentTransport", 1)[1].split(
+                   "function implementFailure", 1)[0]
+               and rev_script.count("job.agent_type") == 4
+               and all(loc in rev_script for loc in (
+                   "if (job.agent_type) opts.agentType = job.agent_type;",
+                   "job.agent_type + ') could not be spawned",
+                   "log('implement ' + job.id + ': ' + job.agent_type")))
+        _check("a missing agents/transport.md yields NO transport agentType "
+               "rather than a guessed one, exactly like resolve_agent_type",
+               resolve_role_agent_type("transport", plugin_dir=tmp)[0] is None)
         _check("a throwing Implement stage no longer skips Gate AND Record",
                "return implementFailure(job);" in rev_script
                and "function implementFailure(job) {" in rev_script

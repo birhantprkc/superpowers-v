@@ -821,6 +821,82 @@ Read the file first if it exists, merge `advisorModel` into the parsed object al
 is already there (including `worktree` from Step 4d), and write the merged result back — never
 truncate the file to just this one key.
 
+### 4f. Two optional native settings — `bashOutputMaxChars` / `taskOutputMaxChars`, and `bashEditDiffEnabled`
+
+**Offer each; never write either without a yes.** Both are **native Claude Code settings**, not
+Compound V keys, verified against `code.claude.com/docs/en/settings-reference` (and
+`/docs/en/hooks#bash` for the third one) rather than assumed from a version number — the same
+discipline Step 4e already applies to `advisorModel`. None of the three was exercised live when
+this step was written (3.7.0), so treat every behavioral claim here as **documented, not
+probed**, and re-verify once against your own project before trusting it at scale.
+
+**`bashOutputMaxChars` / `taskOutputMaxChars` — why now.** A 3.6.0 wide dispatch found Engine C's
+80-turn implementer cap is a real ceiling: a documentation job hit it three times reading a large
+merged diff file-by-file, because Bash output past the default ~30,000-character inline window is
+saved to a file and has to be re-read — each re-read is another turn spent on plumbing, not on the
+task. Both settings raise that window; both are scope `Any file`, so the project's own
+`.claude/settings.json` is a legal place for them, both require **Claude Code v2.1.261 or later**,
+and Claude Code clamps either value into `4000`–`128000` regardless of what is asked for.
+
+> Raising the inline ceiling costs nothing on a small command — a `git status` or a one-file
+> diff still reads back exactly as many characters as it produces. The only downside is a rare
+> huge command flooding context inside the 80-turn cap, which a large-but-bounded value avoids.
+> Shall I show you the edit?
+
+```jsonc
+// .claude/settings.json — the PROJECT's file. Merge only these two keys in; every other key
+// already present (worktree, advisorModel, permissions, hooks, env, ...) is preserved untouched.
+{
+  "bashOutputMaxChars": 100000,
+  "taskOutputMaxChars": 100000
+}
+```
+
+100000 is comfortably above the default (~30,000 for Bash, ~32,000 for background tasks) and
+comfortably under the 128,000 ceiling, leaving headroom before the 80-turn cap without inviting a
+single oversized command to dominate a job's whole context budget. `bashOutputMaxChars` then
+supersedes the `BASH_MAX_OUTPUT_LENGTH` env var; `taskOutputMaxChars` supersedes
+`TASK_MAX_OUTPUT_LENGTH` the same way.
+
+**`taskOutputMaxChars`, honestly: it may already do nothing.** It governs what the `TaskOutput`
+tool reads back from a finished background task — but Claude Code **2.1.277** (September 18,
+2026) removed `TaskOutput` outright: "Claude reads a background task's output file with `Read`
+instead, and the `taskOutputMaxChars` setting … no longer [has] any effect." This development
+session's own `2.1.278` is past that floor. Offer it anyway for a project that may run on an
+older pinned binary, but say plainly that on 2.1.277+ it is inert — `bashOutputMaxChars` is the
+one that actually addresses the 80-turn-cap finding above; `taskOutputMaxChars` is offered only
+for completeness on an older install.
+
+**`bashEditDiffEnabled` — a different scope, and public beta.** Compound V's transcript-watch
+(a parallel effort — see `scripts/compound-v-transcript-watch.py`) attributes in-flight Bash
+writes to a job's lane; this setting is what makes a Bash-made edit carry a diff in the first
+place, so the in-flight lane watch has something to read before the job finishes. Requires
+**Claude Code v2.1.269 or later**, and the settings-reference marks it **public beta**: "The list
+is best effort … The field shape may change." Unlike the two settings above, its scope is **User
+or managed only** — the reference is explicit that "a `true` in a repository's
+`.claude/settings.json` … can't turn the recording on" — so this one goes in the user's own
+`~/.claude/settings.json`, the same file Step 4b already writes to, never the project file.
+
+> With this on, every Bash-made file edit records a diff Claude Code can read back — in every
+> permission mode, not only auto mode and `bypassPermissions`. Compound V's own in-flight lane
+> watch is the reason to want it; it costs nothing to a session that never reads the field. It's
+> a beta field, so the shape may still move. Shall I show you the edit?
+
+```jsonc
+// ~/.claude/settings.json — the USER's file, not the project's, and not .claude/settings.local.json
+// (a project file cannot turn this on, only turn it off if a higher-precedence file set it true).
+// Merge only the "bashEditDiffEnabled" key in; every other key already there is preserved untouched.
+{
+  "bashEditDiffEnabled": true
+}
+```
+
+`CLAUDE_CODE_BASH_EDIT_DIFF` overrides this key for one session, in either direction.
+
+Read each file first if it exists, merge the offered key(s) into the parsed object alongside
+whatever is already there, and write the merged result back — never truncate either file to just
+the key(s) this step adds.
+
 ---
 
 ## Step 5 — Report
@@ -834,8 +910,9 @@ models.
 
 - **Next:** run `/v:onboard` to build the project knowledge base (architecture docs + AGENTS.md bridge). This is a suggestion, not automatic.
 - Report whether Step 1f's `/skill-doctor` hygiene check ran (and its `superpowers-v:` summary, if
-  so) — or was skipped below the version floor — and whether Step 4e's `advisorModel` offer was
-  accepted or declined.
+  so) — or was skipped below the version floor — and whether Step 4e's `advisorModel` offer and
+  Step 4f's `bashOutputMaxChars`/`taskOutputMaxChars`/`bashEditDiffEnabled` offers were accepted or
+  declined.
 
 **Honesty rules:** report only what the probes actually returned. Never print token or
 cost numbers of your own estimation. (Step 1f's context/7-day-token figures are an exception:

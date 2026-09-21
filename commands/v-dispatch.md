@@ -183,6 +183,38 @@ of this repo. Paths under `docs/superpowers/` stay relative; only the plugin's o
    equals the path you emitted** — otherwise the committed artefact is not what ran. Timestamps
    arrive via `args` because the runtime makes the clock globals throw.
 
+   **Wave width vs. the runtime's concurrency cap.** The native Workflow runtime runs "up to 16
+   concurrent agents by default, fewer when Claude Code has fewer CPUs available, including inside
+   a CPU-limited container" (docs: code.claude.com/docs/en/workflows, "Behavior and limits",
+   fetched 2026-09-21). Engine C's `pipeline(wave, implementStage, gateStage, recordStage)` chains
+   Implement → Gate → Record **per job**, so a job holds exactly one agent slot at a time — a wave
+   of W jobs competes for W of those 16 slots, with no per-job multiplier
+   (`compound-v-validate-manifest.py`'s `WAVE_EXCEEDS_RUNTIME_CONCURRENCY` advisory, surfaced by
+   step 3's partition-reviewer, already did this arithmetic against this manifest). A wave over the
+   cap does **not** fail — the extra jobs queue for a slot as earlier ones finish — but before
+   launching a manifest with any wave wider than 16, decide whether you want it to run at full
+   width:
+   ```bash
+   export CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=<n>   # 1-256, Claude Code >= 2.1.269;
+                                                            # <n> >= the widest wave's job count
+   ```
+   Pro plans default the size guideline to `small` (fewer than 5 agents) — that guideline is
+   **advice Claude takes when writing a NEW workflow script, never a cap on a manifest-driven
+   Engine C run you already emitted**; it does not shrink or reject this wave.
+
+   **The usage-limit pause (>= 2.1.271) — three lines.** A run pauses (agents wait, no new ones
+   start) only when **all** of: it is an interactive session signed in with a claude.ai
+   subscription; `autoContinueAtUsageLimit` is on; and the reset is within 24h with the run not
+   already having waited twice. **In `claude -p`/headless, a background session, Remote Control, or
+   an agent-team teammate session the run never pauses at all — the affected agent just fails**,
+   and it is the emitted script's own retry/escalation ladder
+   (`RETRY_MAX_ATTEMPTS_DEFAULT`, the one-shot `CLAUDE_ESCALATION` reviewer lift — see
+   [`failure-policy.md`](../skills/compound-v/failure-policy.md)'s `timeout` class) that catches
+   it, not a pause. This dispatch runs at the top level per the header above, so check which of the
+   two you actually are before reading a `STALE` job's `PAUSED?` hint (step 7's transcript watch,
+   or the liveness sweep on the residual path) as "go check `/workflows`" versus "this already
+   failed and the ladder already handled it."
+
    While it runs, the script writes what the rest of the pipeline needs:
    - `lane-map.json` — each implementer registers its real worktree as its first command, which is
      what lets [`hooks/lane-guard.sh`](../hooks/lane-guard.sh) resolve an acting job at all;

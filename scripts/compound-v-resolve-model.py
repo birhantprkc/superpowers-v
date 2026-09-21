@@ -29,6 +29,16 @@ Vocabulary (never changes when models churn):
 Output: a single JSON object on stdout, e.g.
   {"backend": "codex", "tier": "deep", "model": "gpt-5.6-sol", "effort": "high"}
 
+For `backend: claude`, the CLI (not the `resolve()` function — see
+`apply_effort_cap`) also reads the project's and user's Claude Code
+`settings.json`/`settings.local.json` for a `maxEffortLevel` cap
+(Claude Code 2.1.267+) and adds `effort_capped`:
+  {"backend": "claude", "tier": "deep", "model": "opus", "effort": "medium",
+   "effort_capped": {"requested": "high", "cap": "medium",
+                      "source": ".claude/settings.json"}}
+`effort_capped` is `null` when nothing capped the request (including on every
+non-claude backend, which `maxEffortLevel` cannot affect).
+
 Exit non-zero if a tier cannot be resolved for a backend (and no
 --explicit-model was given).
 
@@ -151,6 +161,190 @@ VALID_STANCES = ("balanced", "conservative", "cost-aware", "claude-only")
 # task-type by passing --effort explicitly; this is only the fallback.
 DEFAULT_EFFORT_FOR_TIER = {"frontier": "high", "deep": "high",
                            "standard": "medium", "light": "low"}
+
+# --------------------------------------------------------------------------- #
+# Effort cap from Claude Code's own `maxEffortLevel` setting (2.1.267+).
+#
+# Verified against https://code.claude.com/docs/en/settings-reference (fetched
+# via curl of the `.md` source; WebFetch's own summary of this page truncated
+# before the actual `### maxEffortLevel` / `### modelSettings` bodies, so the
+# quotes below come straight from the underlying markdown):
+#
+#   maxEffortLevel: "Cap the effort level a session can use, leaving lower
+#   levels available. Any higher level runs at the cap instead, including one
+#   from /effort, the /model picker, --effort, CLAUDE_CODE_EFFORT_LEVEL, a
+#   skill's or subagent's `effort` frontmatter, or the model's own default. ...
+#   Scope: Any file. ... When several scopes set a cap, the lowest applies, so
+#   a cap set in one scope can't be raised from another. Type: string, one of
+#   "low", "medium", "high", "xhigh", or "max". A "max" value sets no cap. ...
+#   Per-model caps: add maxEffortLevel to a model's modelSettings entry. That
+#   entry REPLACES this key for the model only within the settings source that
+#   sets both ... Set "max" there to exempt the model from that source's cap;
+#   Claude Code still applies caps from other sources."
+#
+#   modelSettings: "Type: object mapping a model name to an object with an
+#   effortLevel field ..., a maxEffortLevel field, or both." Claude Code itself
+#   "matches that model's alias, date-suffixed, [1m], and recognized
+#   provider-specific IDs to the same entry" — that alias table is internal to
+#   Claude Code; this script has no access to it (see _alias_matches_model_key).
+#
+# NOTE on the task's original phrasing ("takes the LOWEST maxEffortLevel found,
+# top-level or per-model when present"): a naive min-of-everything gets the
+# doc's own worked example wrong (top-level "medium" + per-model "max" on one
+# model means UNCAPPED for that model, not "medium"). The correct algorithm,
+# implemented below, is per-file first (per-model REPLACES top-level within
+# that one file), then MIN across files.
+#
+# This only ever caps `backend: claude` jobs — `maxEffortLevel` is a Claude
+# Code client setting; it has no meaning for a codex/antigravity/cursor/
+# opencode worker process, which Claude Code never applies it to.
+# --------------------------------------------------------------------------- #
+
+# Same ladder the doc states for maxEffortLevel. `max` is a cap-only sentinel
+# ("sets no cap") — this resolver's own EFFORTS never produces "max" as a
+# *requested* value — but it still needs a rank, above xhigh, purely so the
+# MIN-across-files comparison below treats an exempting per-model "max" as
+# "never the tightest cap in the room."
+EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+
+
+def _user_claude_dir():
+    """``~/.claude`` unless overridden — the exact precedence
+    ``compound-v-transcript-watch.py:session_roots`` already uses for the same
+    directory (mirrored here, not imported: that script is a standalone CLI
+    with no shared-library role, per CONVENTIONS.md keep-in-sync-by-comment
+    style already used elsewhere in this file)."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def _project_claude_dir(config_path=None, repo_dir=None):
+    """The project ``.claude/`` directory to read ``settings.json`` /
+    ``settings.local.json`` from. Every real caller already passes
+    ``--config .claude/compound-v.json`` (execution-manifest.md), so prefer the
+    directory that already holds ``--config`` — no new flag needed on existing
+    call sites. Falls back to ``<repo_dir or cwd>/.claude`` for a caller that
+    passes neither (e.g. an explicit-model-only resolution)."""
+    if config_path:
+        parent = os.path.dirname(os.path.abspath(config_path))
+        if os.path.basename(parent) == ".claude":
+            return parent
+    return os.path.join(os.path.abspath(repo_dir or os.getcwd()), ".claude")
+
+
+def default_settings_paths(config_path=None, repo_dir=None):
+    """Ordered ``[(path, label), ...]`` of the Claude Code settings files this
+    resolver reads **read-only** to compute an effort cap: project settings,
+    project LOCAL settings, then the user's own settings. This does **not**
+    reach organization-managed settings (a separate, OS-specific path — see
+    /docs/en/managed-settings) — a managed ``maxEffortLevel`` still applies at
+    runtime; this resolver just can't see it, so a job can still get silently
+    capped by the harness even when this function reports ``effort_capped:
+    null``. Order only decides the tie-break for which path lands in
+    ``effort_capped.source`` when two files set the identical lowest cap — the
+    cap value itself is a MIN over every file (see effective_effort_cap), so
+    read order never changes the *answer*, only its attribution."""
+    claude_dir = _project_claude_dir(config_path, repo_dir)
+    user_dir = _user_claude_dir()
+    project = os.path.join(claude_dir, "settings.json")
+    local = os.path.join(claude_dir, "settings.local.json")
+    user = os.path.join(user_dir, "settings.json")
+    return [(project, project), (local, local), (user, user)]
+
+
+def _load_settings_file(path):
+    """Parsed dict for one settings JSON file, or ``None`` if it is missing,
+    unreadable, not valid JSON, or its root is not an object. Read-only; never
+    raises — a settings file this resolver can't parse degrades to "sets no
+    cap", never a crash (this is a routing side-lookup, not the resolver's
+    contract)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _alias_matches_model_key(model, key):
+    """Best-effort match between the resolver's own tier alias (``opus`` /
+    ``sonnet`` / ``fable``) and a ``modelSettings`` key a human wrote in their
+    OWN settings file. Claude Code's real alias table (canonical id, dated
+    snapshot, ``[1m]`` suffix, provider-specific id — settings-reference.md
+    `modelSettings`) is internal and unavailable here, so this is deliberately
+    narrower: an exact match, or a key whose ``-``-separated segments contain
+    the alias (covers the realistic case of a canonical id like
+    ``claude-opus-5`` written for the alias ``opus``). A cap this narrower
+    match misses is invisible to THIS script but still applies at runtime."""
+    if key == model:
+        return True
+    return model in key.split("-")
+
+
+def _file_effort_cap(settings, model):
+    """The effective ``maxEffortLevel`` ONE settings dict sets for ``model``,
+    or ``None`` if it sets none. A matching ``modelSettings.<key>`` entry
+    REPLACES the top-level ``maxEffortLevel`` for that model within this one
+    file — it does not additionally lower it — so a per-model ``"max"`` here
+    means this file sets NO cap for the model even under a stricter top-level
+    key. Malformed values (wrong type, unrecognized level name) are ignored."""
+    if not isinstance(settings, dict):
+        return None
+    model_settings = settings.get("modelSettings")
+    if isinstance(model_settings, dict):
+        for key, entry in model_settings.items():
+            if not isinstance(entry, dict) or not _alias_matches_model_key(model, str(key)):
+                continue
+            per_model = entry.get("maxEffortLevel")
+            if isinstance(per_model, str) and per_model in EFFORT_RANK:
+                return per_model  # replaces the top-level key for this model
+    top = settings.get("maxEffortLevel")
+    if isinstance(top, str) and top in EFFORT_RANK:
+        return top
+    return None
+
+
+def effective_effort_cap(model, settings_paths):
+    """``(cap, source)`` — the LOWEST per-file effective cap (see
+    ``_file_effort_cap``) across ``settings_paths`` for ``model``, or
+    ``(None, None)`` if none of them cap it. An overall winning cap of
+    ``"max"`` means, per the doc, no cap at all — return ``(None, None)`` for
+    it rather than a cap named "max"."""
+    best_cap = None
+    best_source = None
+    for path, label in settings_paths:
+        cap = _file_effort_cap(_load_settings_file(path), model)
+        if cap is None:
+            continue
+        if best_cap is None or EFFORT_RANK[cap] < EFFORT_RANK[best_cap]:
+            best_cap, best_source = cap, label
+    if best_cap == "max":
+        return None, None
+    return best_cap, best_source
+
+
+def apply_effort_cap(result, settings_paths):
+    """Return a NEW result dict with ``effort_capped`` added, lowering
+    ``effort`` to the cap when the resolved effort ranks above it. Only
+    ``backend: claude`` results are affected — ``maxEffortLevel`` is a Claude
+    Code client setting with no meaning for an external worker process.
+
+    Deliberately kept OUT of ``resolve()``: that function is imported and
+    called directly (not just via subprocess) by
+    ``compound-v-epic-arbiter.py`` and ``compound-v-classify-request.py``, and
+    it must stay a pure function of its arguments — no filesystem reads. Only
+    ``main()`` calls this, after ``resolve()`` returns."""
+    out = dict(result)
+    if out.get("backend") != "claude":
+        out["effort_capped"] = None
+        return out
+    requested = out.get("effort")
+    cap, source = effective_effort_cap(out.get("model"), settings_paths)
+    if cap is not None and requested in EFFORT_RANK and EFFORT_RANK[requested] > EFFORT_RANK[cap]:
+        out["effort_capped"] = {"requested": requested, "cap": cap, "source": source}
+        out["effort"] = cap
+    else:
+        out["effort_capped"] = None
+    return out
 
 
 def _project_config_module():
@@ -313,6 +507,15 @@ def main(argv):
         help="manifest model override; always wins, skips resolution",
     )
     parser.add_argument(
+        "--repo-dir",
+        default=None,
+        help=(
+            "project root to locate .claude/settings.json and settings.local.json "
+            "under (for the maxEffortLevel cap); default is --config's own "
+            "directory when it ends in .claude, else the current directory"
+        ),
+    )
+    parser.add_argument(
         "--selftest", action="store_true", help="run built-in self-tests"
     )
     args = parser.parse_args(argv[1:])
@@ -335,6 +538,9 @@ def main(argv):
     except ValueError as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         return 1
+
+    settings_paths = default_settings_paths(config_path=args.config, repo_dir=args.repo_dir)
+    result = apply_effort_cap(result, settings_paths)
 
     print(json.dumps(result))
     return 0
@@ -588,6 +794,140 @@ def _selftest():
            all(isinstance(DEFAULT_MODELS_BY_STANCE[st][b].get(t), str)
                and DEFAULT_MODELS_BY_STANCE[st][b][t].strip()
                for st in VALID_STANCES for b in BACKENDS for t in TIERS))
+
+    # --- effort cap from Claude Code settings (Fact 1, maxEffortLevel 2.1.267+) ---
+    def _write_json(path, obj):
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+
+    with tempfile.TemporaryDirectory() as _sd:
+        _proj = os.path.join(_sd, "settings.json")
+        _local = os.path.join(_sd, "settings.local.json")
+        _user = os.path.join(_sd, "user-settings.json")
+        _paths = [(_proj, ".claude/settings.json"),
+                  (_local, ".claude/settings.local.json"),
+                  (_user, "~/.claude/settings.json")]
+
+        _write_json(_proj, {"maxEffortLevel": "medium"})
+        _write_json(_local, {})
+        _write_json(_user, {})
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)  # default effort: high
+        expect(
+            "cap below request -> capped with source",
+            capped["effort"] == "medium"
+            and capped["effort_capped"] == {
+                "requested": "high", "cap": "medium", "source": ".claude/settings.json",
+            },
+        )
+
+        _write_json(_proj, {"maxEffortLevel": "xhigh"})
+        capped = apply_effort_cap(resolve("claude", "light"), _paths)  # default effort: low
+        expect(
+            "cap above request -> effort_capped null",
+            capped["effort"] == "low" and capped["effort_capped"] is None,
+        )
+
+        _write_json(_proj, {
+            "maxEffortLevel": "xhigh",
+            "modelSettings": {"opus": {"maxEffortLevel": "low"}},
+        })
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)  # -> opus, effort high
+        expect(
+            "per-model cap overrides top-level when lower",
+            capped["effort"] == "low" and capped["effort_capped"]["cap"] == "low",
+        )
+
+        # Doc's own worked example: a per-model "max" REPLACES (never intersects
+        # with) a stricter top-level cap within the SAME file, so the model is
+        # fully exempt from this file even though its top-level cap is stricter.
+        _write_json(_proj, {
+            "maxEffortLevel": "medium",
+            "modelSettings": {"opus": {"maxEffortLevel": "max"}},
+        })
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)
+        expect(
+            "per-model max exempts the model despite a stricter top-level cap",
+            capped["effort"] == "high" and capped["effort_capped"] is None,
+        )
+
+        # modelSettings keyed by a canonical id (not the bare alias) still
+        # matches, via the narrower segment-based heuristic.
+        _write_json(_proj, {"modelSettings": {"claude-opus-5": {"maxEffortLevel": "low"}}})
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)
+        expect(
+            "canonical-id modelSettings key matches the opus alias",
+            capped["effort_capped"] is not None and capped["effort_capped"]["cap"] == "low",
+        )
+
+        # Malformed settings (wrong types) are ignored, never a crash.
+        _write_json(_proj, {"maxEffortLevel": 3})
+        _write_json(_local, {"modelSettings": "not-a-map"})
+        _write_json(_user, "not-an-object")
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)
+        expect(
+            "malformed settings ignored, no crash",
+            capped["effort_capped"] is None and capped["effort"] == "high",
+        )
+
+        # A non-claude backend is never capped, even with a matching restrictive
+        # file present.
+        _write_json(_proj, {"maxEffortLevel": "low"})
+        _write_json(_local, {})
+        _write_json(_user, {})
+        r = resolve("codex", "deep")
+        capped = apply_effort_cap(r, _paths)
+        expect(
+            "non-claude backend never capped",
+            capped["effort"] == r["effort"] and capped["effort_capped"] is None,
+        )
+
+        # The lowest cap across scopes wins, wherever it lives.
+        _write_json(_proj, {"maxEffortLevel": "medium"})
+        _write_json(_user, {"maxEffortLevel": "low"})
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)
+        expect(
+            "lowest cap across scopes wins",
+            capped["effort_capped"]["cap"] == "low"
+            and capped["effort_capped"]["source"] == "~/.claude/settings.json",
+        )
+
+        # No settings files at all -> uncapped, no crash.
+        os.remove(_proj)
+        os.remove(_local)
+        os.remove(_user)
+        capped = apply_effort_cap(resolve("claude", "deep"), _paths)
+        expect(
+            "missing settings files -> uncapped, no crash",
+            capped["effort_capped"] is None and capped["effort"] == "high",
+        )
+
+        # default_settings_paths wiring: CLAUDE_CONFIG_DIR relocates the user
+        # file, and a --config under a literal .claude/ dir relocates the
+        # project files, with no new flag needed at real call sites.
+        _proj_dir = os.path.join(_sd, "proj", ".claude")
+        os.makedirs(_proj_dir)
+        _write_json(os.path.join(_proj_dir, "settings.json"), {"maxEffortLevel": "medium"})
+        _user_dir = os.path.join(_sd, "userhome")
+        os.makedirs(_user_dir)
+        _write_json(os.path.join(_user_dir, "settings.json"), {"maxEffortLevel": "low"})
+        _old_cfgdir = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = _user_dir
+        try:
+            _dsp = default_settings_paths(
+                config_path=os.path.join(_proj_dir, "compound-v.json")
+            )
+            capped = apply_effort_cap(resolve("claude", "deep"), _dsp)
+        finally:
+            if _old_cfgdir is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = _old_cfgdir
+        expect(
+            "default_settings_paths finds project (via --config) and "
+            "CLAUDE_CONFIG_DIR-relocated user settings; lowest (user, low) wins",
+            capped["effort_capped"] is not None
+            and capped["effort_capped"]["cap"] == "low",
+        )
 
     # Unknown backend / tier / effort raise.
     expect("unknown backend raises", raises(lambda: resolve("gemini", "deep")))

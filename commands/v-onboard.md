@@ -38,6 +38,42 @@ of this repo.
   **path-scoped rules** step inside it: `rules-plan` at DIAGNOSE, one drafted `.claude/rules/*.md`
   per area at the GATE, `rules-lint` blocking before COMMIT (§Path-scoped rules in the skill).
 
+## Note on AGENTS.md-only projects (Claude Code 2.1.277+)
+
+Since Claude Code v2.1.277, a project with an `AGENTS.md` and **no** `CLAUDE.md` (or
+`CLAUDE.local.md`, in the working directory or above it) is read **natively** — no
+import, no setting, no generated bridge required. Per
+[`code.claude.com/docs/en/claude-md#agents-md`](https://code.claude.com/docs/en/claude-md#agents-md):
+"Claude Code can read AGENTS.md as your project instructions, so a repository already
+set up for other coding agents works without adding a CLAUDE.md, an import, or a
+setting." (Reading it directly still requires v2.1.277 or later; older sessions, and
+some configurations such as Amazon Bedrock or disabled hooks, need the `@AGENTS.md`
+import instead — see "When AGENTS.md support is unavailable" on that page.)
+
+This pipeline still generates **both** files (detect-and-bridge,
+[`skills/compound-v/onboarding.md`](../skills/compound-v/onboarding.md) §"Detect-and-bridge")
+because the generated `CLAUDE.md` bridge — `@AGENTS.md` plus an optional `## Claude
+Code` section — carries content `AGENTS.md` alone does not. This very repo's own
+`CLAUDE.md` is that exact pattern: its `## Claude Code` section holds the model policy
+(Opus by default / Sonnet exception / never Haiku), the advisor pairing and the
+project-only `advisorModel` setting, the `/v:remember` / `/v:memory-refresh` recall
+surface, and the architecture-doc pointers — none of which belongs in the
+tool-portable `AGENTS.md`.
+
+A downstream project that wants a single file can delete the generated `CLAUDE.md`
+**only if** its `## Claude Code` section is empty or the project genuinely has no
+Claude-specific instructions — check first: deleting it while it holds real content
+loses that content, not just a redundant wrapper. Deleting it also changes behavior
+beyond "does it still load": with the bridging `CLAUDE.md` in place, `InstructionsLoaded`
+hooks fire for it and it is listed in `/memory` and `/context`; reading `AGENTS.md`
+directly does neither (same page, "Where AGENTS.md differs from CLAUDE.md").
+
+Docs-only for this note — no `--agents-only` generator flag was added.
+`scripts/compound-v-onboard.py` has no `CLAUDE.md`/`AGENTS.md` writer function to gate
+(the bridge is written by the WRITE-phase prose in `skills/compound-v/onboarding.md`,
+outside a Compound V harness change's usual file lane), so a flag would mean editing
+that skill file's prose, not adding a small, testable Python branch.
+
 ## Non-negotiables (the skill is authoritative — these are the ones you must not lose)
 
 1. **Existing `AGENTS.md`/`CLAUDE.md`/foreign rule files are quoted as evidence; their directives are
