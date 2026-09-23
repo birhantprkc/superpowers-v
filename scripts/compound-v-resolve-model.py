@@ -27,7 +27,7 @@ Vocabulary (never changes when models churn):
                                     error naming the rule; use `high` instead)
 
 Output: a single JSON object on stdout, e.g.
-  {"backend": "codex", "tier": "deep", "model": "gpt-5.6-sol", "effort": "high"}
+  {"backend": "codex", "tier": "deep", "model": "gpt-6-sol", "effort": "high"}
 
 For `backend: claude`, the CLI (not the `resolve()` function — see
 `apply_effort_cap`) also reads the project's and user's Claude Code
@@ -83,12 +83,24 @@ _CLAUDE_CONSERVATIVE = {"frontier": "fable", "deep": "opus",
 # Cost-aware never reaches for the most expensive seat; its ceiling is Opus.
 _CLAUDE_COST_AWARE = {"frontier": "opus", "deep": "opus",
                       "standard": "sonnet", "light": "sonnet"}
-# GPT-5.6 family (Sol/Terra/Luna), verified live 2026-07-10: all three confirmed working on
-# codex-cli 0.144.1. gpt-5.6-sol specifically requires codex-cli >= 0.143.0 (confirmed: broken
-# with a clear 400 "requires a newer version of Codex" on 0.142.5, works on 0.144.1) -- an
-# under-floor client fails LOUD (not silent; the failure-policy retries once then halts cleanly).
-_CODEX = {"frontier": "gpt-5.6-sol", "deep": "gpt-5.6-sol",
-          "standard": "gpt-5.6-terra", "light": "gpt-5.6-luna"}
+# GPT-6 family (Astra/Sol/Luna), probed 2026-09-24 on codex-cli 0.156.1 via
+# `codex debug models` (the raw catalog dump; Codex now HAS a model-list command --
+# several docs in this repo used to say otherwise, which is now false). Catalog
+# order by priority: gpt-6-astra ("Frontier intelligence for the most demanding
+# work"), gpt-6-sol ("Workhorse model for coding and everyday work"), gpt-6-luna
+# ("Fast and affordable model for easier tasks") -- there is no gpt-6-terra. All
+# three answered a trivial `codex exec` with this repo's pinned flag set (rc 0,
+# `thread.started` present), so the flag set is re-verified on 0.156.1.
+# `deep` and `standard` deliberately SHARE gpt-6-sol and differ only by effort --
+# tier and effort are orthogonal axes in this resolver, and Sol has no separate
+# "standard-strength" sibling the way Astra/Sol/Luna cover frontier/deep/light.
+# The older GPT-5.6 family (Sol/Terra/Luna, verified live 2026-07-10 on codex-cli
+# 0.144.1) is listed "Older ..." in the catalog and still works -- gpt-5.5 is
+# also still listed but retires 2026-10-14 (upgrade target: gpt-5.6-sol). An
+# under-floor client fails LOUD (not silent; the failure-policy retries once
+# then halts cleanly).
+_CODEX = {"frontier": "gpt-6-astra", "deep": "gpt-6-sol",
+          "standard": "gpt-6-sol", "light": "gpt-6-luna"}
 # Antigravity (agy): FALLBACK default; the live catalog is discoverable headlessly
 # (`agy models </dev/null`), and /v:models/+/v:init pipe it through
 # compound-v-discover-models.py to OVERRIDE this map in .claude/compound-v.json. Names
@@ -114,6 +126,11 @@ _CURSOR = {"frontier": "auto", "deep": "auto", "standard": "auto", "light": "aut
 # per its own docs, defaults to allowing all operations -- see
 # skills/backend-launcher/adapter-opencode.md for the mandatory env-scrub + pinned
 # opencode.json mitigation. NEVER haiku anywhere (light is a free model, not haiku).
+# `standard` stayed on gpt-5.6-terra during the 2026-09-24 codex GPT-6 pass: `opencode
+# models openai` on this machine returned "Provider not found: openai" (no openai
+# provider/credentials configured in this environment), so gpt-6-sol's presence in
+# opencode's own catalog could not be live-confirmed here -- do not swap this string
+# on the codex probe alone; re-check `opencode models openai` before changing it.
 _OPENCODE = {
     "frontier": "anthropic/claude-opus-4-6",
     "deep": "anthropic/claude-opus-4-6",
@@ -150,8 +167,15 @@ BACKENDS = ("claude", "codex", "antigravity", "cursor", "opencode")
 TIERS = ("frontier", "deep", "standard", "light")
 # `xhigh` is valid iff backend == "codex": it maps to codex's kernel
 # model_reasoning_effort dimension, which live-accepts xhigh (verified
-# 2026-07-11 on codex-cli 0.144.1). resolve() rejects xhigh for every other
-# backend with a clear error naming the rule.
+# 2026-07-11 on codex-cli 0.144.1, re-verified 2026-09-24 on 0.156.1).
+# resolve() rejects xhigh for every other backend with a clear error naming
+# the rule. The 2026-09-24 GPT-6 catalog probe (`codex debug models`) also
+# lists `ultra` (astra/sol only -- "Maximum reasoning with automatic task
+# delegation") and `max` above xhigh on the ladder; NEITHER is adopted into
+# this vocabulary. `ultra` auto-delegates to sub-agents that would write
+# outside a job's declared lane, breaking the scope-gate model; `max` is
+# simply not adopted this release. Both stay routable only by an explicit
+# --explicit-model / manifest override, never through the tier/effort map.
 EFFORTS = ("low", "medium", "high", "xhigh")
 # Stance vocabulary — DUPLICATED on purpose from compound-v-validate-manifest.py:VALID_STANCES.
 # Both scripts are standalone, stdlib-only CLIs; do NOT introduce a shared import. Keep in sync.
@@ -794,6 +818,14 @@ def _selftest():
            all(isinstance(DEFAULT_MODELS_BY_STANCE[st][b].get(t), str)
                and DEFAULT_MODELS_BY_STANCE[st][b][t].strip()
                for st in VALID_STANCES for b in BACKENDS for t in TIERS))
+    # Pin the literal codex default map (2026-09-24 GPT-6 update) -- the structural checks
+    # above ("frontier resolves", "no haiku", "every cell populated") pass regardless of
+    # WHICH model each cell names, so a stale or wrong string would slip through unnoticed
+    # without this exact-match guard. frontier/light are the distinct rungs (astra/luna);
+    # deep and standard deliberately share gpt-6-sol, differing only by effort.
+    expect("codex default map matches the 2026-09-24 GPT-6 decision",
+           DEFAULT_MODELS["codex"] == {"frontier": "gpt-6-astra", "deep": "gpt-6-sol",
+                                       "standard": "gpt-6-sol", "light": "gpt-6-luna"})
 
     # --- effort cap from Claude Code settings (Fact 1, maxEffortLevel 2.1.267+) ---
     def _write_json(path, obj):

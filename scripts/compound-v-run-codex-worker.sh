@@ -403,7 +403,9 @@ fi
 # Effort vocabulary: `xhigh` is valid iff backend is codex — and this worker IS
 # the codex backend, so it is accepted here (the resolver + manifest validator
 # reject xhigh for every other backend). model_reasoning_effort=xhigh
-# live-verified 2026-07-11 on codex-cli 0.144.1.
+# live-verified 2026-07-11 on codex-cli 0.144.1; re-verified 2026-09-24 on codex-cli
+# 0.156.1 with gpt-6-sol/gpt-6-luna (rc 0, thread.started present, output-last-message
+# written). `ultra`/`max` (GPT-6) are NOT in this vocabulary — never adopted.
 if [ -n "$EFFORT" ]; then
   case "$EFFORT" in
     low|medium|high|xhigh) : ;;
@@ -560,7 +562,8 @@ fi
 mkdir -p "$(dirname "$EVENTS_LOG")" 2>/dev/null || die "cannot create events-log dir for: $EVENTS_LOG"
 
 # --- run the headless Codex worker -------------------------------------------
-# Pinned flag set, verified live against codex-cli 0.144.1. NOTE: `--ask-for-approval
+# Pinned flag set, verified live against codex-cli 0.144.1; re-verified 2026-09-24 on
+# codex-cli 0.156.1 with the GPT-6 family (gpt-6-sol, gpt-6-luna). NOTE: `--ask-for-approval
 # never` is INVALID for `codex exec` (top-level/interactive flag only) and is
 # deliberately OMITTED — `codex exec` already defaults to approval: never.
 #
@@ -578,7 +581,8 @@ fi
 STDERR_LOG="$ART/codex_stderr.log"
 # With `--json`, codex prints its event stream (JSONL) to STDOUT — the FIRST line is
 # `{"type":"thread.started","thread_id":"<uuid>"}` (live-probed, codex-cli 0.144.1;
-# library-audit/2026-07-11-session-aware-workers.md §1). We redirect that stdout to the
+# library-audit/2026-07-11-session-aware-workers.md §1; re-verified 2026-09-24 on 0.156.1
+# with gpt-6-sol/gpt-6-luna). We redirect that stdout to the
 # EVENTS_LOG so (a) it never reaches the worker's own stdout — reserved for the session
 # line + canonical job_result JSON — and (b) the id and any progress signal can be parsed
 # from it. `--output-last-message` still writes the final agent message verbatim (the two
@@ -597,7 +601,8 @@ exit_code=0
 # exec` also reads stdin when it is not a TTY and will BLOCK ("Reading additional
 # input from stdin...") in a non-interactive / background context. </dev/null makes
 # stdin an immediate EOF so codex uses only the positional prompt and never hangs.
-# (Verified live against codex-cli 0.144.1 — without it the worker hangs indefinitely.)
+# (Verified live against codex-cli 0.144.1 — without it the worker hangs indefinitely;
+# re-verified 2026-09-24 on codex-cli 0.156.1.)
 run_codex() {
   if [ -n "$OUTPUT_SCHEMA" ]; then
     # shellcheck disable=SC2086
@@ -652,7 +657,8 @@ fi
 # --- capture session_id + summary --------------------------------------------
 # session_id = the codex thread UUID, parsed STRUCTURALLY from the `--json` event
 # stream (EVENTS_LOG). The FIRST `{"type":"thread.started","thread_id":"<uuid>"}`
-# event carries it (live-probed, codex-cli 0.144.1; audit §1); that thread_id IS the
+# event carries it (live-probed, codex-cli 0.144.1; audit §1; re-verified 2026-09-24 on
+# 0.156.1); that thread_id IS the
 # id `codex exec resume <uuid>` accepts. The old stderr-banner UUID scrape is GONE —
 # it was a fragile any-UUID-shaped-token heuristic; this reads the id from the field
 # codex actually emits it in.

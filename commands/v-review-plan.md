@@ -31,7 +31,7 @@ of this repo.
       ```bash
       "$CV/scripts/compound-v-codex-review.sh" --plan-file "<plan>" --repo "$PWD" --effort xhigh
       ```
-      (Add `--context-file <audit>` for any archaeology/domain/library audits that ground the review.) The model is resolved for codex / tier `deep`. Codex reads the repo read-only and returns findings JSON per `schemas/plan-review.schema.json`.
+      (Add `--context-file <audit>` for any archaeology/domain/library audits that ground the review.) The model is resolved for codex / tier `frontier` (e.g. `gpt-6-astra`) — review runs on the strongest codex tier, one rung above implementation's `deep`/`standard`. Codex reads the repo read-only and returns findings JSON per `schemas/plan-review.schema.json`.
    2. **No Codex, an advisor configured → an advisor-assisted second look.** Dispatch one
       read-only Opus subagent through the Agent tool with the same adversarial prompt the
       driver above embeds, plus one addition: consult the advisor tool before writing the

@@ -536,14 +536,14 @@ was, in those two fields).
   "models": {
     "balanced": {
       "claude":      { "frontier": "fable", "deep": "opus",  "standard": "sonnet",                "light": "sonnet" },
-      "codex":       { "frontier": "gpt-5.6-sol", "deep": "gpt-5.6-sol", "standard": "gpt-5.6-terra", "light": "gpt-5.6-luna" },
+      "codex":       { "frontier": "gpt-6-astra", "deep": "gpt-6-sol", "standard": "gpt-6-sol", "light": "gpt-6-luna" },
       "antigravity": { "deep": "Gemini 3.1 Pro (High)", "standard": "Gemini 3.1 Pro (Low)", "light": "Gemini 3.8 Flash (Low)" },
       "cursor":      { "deep": "auto",                  "standard": "auto",                  "light": "auto" },
       "opencode":    { "deep": "anthropic/claude-opus-4-6", "standard": "openai/gpt-5.6-terra", "light": "opencode/mimo-v2.5-free" }
     },
     "cost-aware": {
       "claude":      { "frontier": "opus",  "deep": "opus",  "standard": "sonnet",                "light": "sonnet" },
-      "codex":       { "frontier": "gpt-5.6-sol", "deep": "gpt-5.6-sol", "standard": "gpt-5.6-terra", "light": "gpt-5.6-luna" },
+      "codex":       { "frontier": "gpt-6-astra", "deep": "gpt-6-sol", "standard": "gpt-6-sol", "light": "gpt-6-luna" },
       "antigravity": { "deep": "Gemini 3.1 Pro (High)", "standard": "Gemini 3.1 Pro (Low)", "light": "Gemini 3.8 Flash (Low)" },
       "cursor":      { "deep": "auto",                  "standard": "auto",                  "light": "auto" },
       "opencode":    { "deep": "anthropic/claude-opus-4-6", "standard": "openai/gpt-5.6-terra", "light": "opencode/mimo-v2.5-free" }
@@ -661,8 +661,10 @@ identically to `balanced`. Only `cost-aware.claude.standard` differs: `sonnet`, 
   NEVER `haiku` anywhere. If `agy` is present, the Step 1a-bis discovery
   pipe has already overwritten the `antigravity` block with **real** discovered names
   (`agy models </dev/null` → discovery script), so the block above is just the fallback
-  used when `agy` is absent; codex has no list command (curated + user-overridable);
-  claude uses native tier aliases. Tell the user they can refresh or customize this map any time
+  used when `agy` is absent; codex gets no equivalent live-discovery step here — this
+  step just seeds the static GPT-6 default above (codex's own live discovery, via
+  `codex debug models` since codex-cli 0.156.1, is `/v:models` §1b's job, run later or
+  on demand); claude uses native tier aliases. Tell the user they can refresh or customize this map any time
   with [`/v:models`](v-models.md) — they do **not** need to hand-edit JSON. The map
   is project-local config; it is documented but not committed in the plugin repo.
 

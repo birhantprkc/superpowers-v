@@ -19,14 +19,50 @@ Ranking (antigravity / Gemini-family default):
     reported under `available` and can be set explicitly, but are not auto-assigned.
   - A model name carries its effort in trailing parens, e.g. "Gemini 3.1 Pro (High)".
   - deep  = strongest series (Pro > Flash; higher version breaks ties) at its TOP effort.
-  - frontier = the same as deep for every external backend (no vendor rung above it).
+  - frontier = the same as deep -- for backends whose catalog has no separate top rung
+    above their strongest everyday model (antigravity/Gemini has no "Ultra" tier here;
+    cursor/opencode are opaque strings, not ranked at all). This is NOT universal: codex
+    (below) has a genuine top rung (gpt-6-astra above gpt-6-sol) and frontier is picked
+    as that distinct model, never mirrored from deep.
   - light = weakest series at its LOWEST effort.
   - standard = the strong series at a LOWER effort if it has one (a capable model, cheaper);
     else the weak series at its top effort; else the median of the catalog.
 
+Ranking (codex, `--backend codex`):
+  - Input is the RAW JSON `codex debug models` prints: on codex-cli 0.156.1 (live-checked
+    2026-09-24) that is a top-level OBJECT ``{"models": [...]}``, not a bare array --
+    `propose_codex` accepts either shape. Each catalog entry is an object per model with
+    `slug`, `display_name`, `description`, `visibility` ("list"/"hide"), `priority` (lower
+    = shown first / stronger), `upgrade` (null or {model, migration_markdown,
+    retirement_at}), `supported_reasoning_levels` ([{effort, description}, ...]),
+    `default_reasoning_level`, `context_window`) -- piped in, never fetched by this script.
+  - Keep only `visibility == "list"` entries for `available`; a `hide`d entry (e.g. an
+    internal reserve/auto-review slug) never appears in `available` or in a proposal.
+  - Of those, drop any whose `upgrade` carries a `retirement_at` from the PROPOSAL
+    candidate pool (it still appears in `available`, and separately in `retiring`) --
+    routing new work onto a model that is already scheduled to retire is a foreseeable
+    failure, not a coincidence.
+  - Group the remaining candidates by FAMILY: the slug up to (not including) the last
+    `-<suffix>` when that suffix is alphabetic (`gpt-6-astra` -> family `gpt-6`); a slug
+    with no such alphabetic suffix (`gpt-5.5`) is its own one-member family. This keeps
+    `gpt-6` and the older `gpt-5.6` from colliding into one family by the `gpt-` prefix.
+  - The winning family is the one containing the single lowest `priority` value anywhere
+    in the candidate pool; order its members by `priority` ascending (lowest = strongest).
+  - `frontier` = 1st in that order; `deep` = 2nd if the family has >= 2 members, else the
+    same 1st; `standard` = same model as `deep` (tier and effort are orthogonal axes --
+    see compound-v-resolve-model.py -- so `deep`/`standard` legitimately share a model and
+    differ only by effort); `light` = last in that order.
+  - `efforts_not_adopted` = every effort name appearing in any visible entry's
+    `supported_reasoning_levels` that is outside this project's adopted `low|medium|high|
+    xhigh` vocabulary (sorted, deduplicated) -- visible so a new rung (`ultra`, `max`, or
+    whatever comes next) is never silently invisible, without being auto-routable.
+
 Usage:
   agy models </dev/null | compound-v-discover-models.py --backend antigravity
   compound-v-discover-models.py --backend antigravity --from-file catalog.txt \
+      --write-config .claude/compound-v.json
+  codex debug models | compound-v-discover-models.py --backend codex
+  compound-v-discover-models.py --backend codex --from-file catalog.json \
       --write-config .claude/compound-v.json
   compound-v-discover-models.py --selftest
 
@@ -138,14 +174,116 @@ def propose(catalog_lines, family="Gemini"):
         ordered = sorted(fam, key=lambda p: (p["strength"], p["version"], p["effort_rank"]))
         standard = ordered[len(ordered) // 2]["full"]
 
-    # `frontier` is the extreme seat (v3.0.5). For an external backend it is the
-    # SAME model as `deep`: no vendor here ships a rung above its own top model, and
-    # proposing a distinct one would be a fabricated route. Only `claude` genuinely
-    # separates them, and its map is native aliases, not a discovered catalog.
+    # `frontier` is the extreme seat (v3.0.5). For THIS ranker (antigravity/Gemini-style
+    # single-vendor catalogs with no rung above the strongest everyday model) it is the
+    # SAME model as `deep`: proposing a distinct one would be a fabricated route. This is
+    # a property of this ranker's catalogs, not a universal rule -- `propose_codex` below
+    # covers a backend whose catalog DOES carry a genuine top rung, and there `frontier`
+    # is picked as that distinct model. Only `claude` otherwise separates them, via
+    # native aliases, not a discovered catalog.
     return {"available": available,
             "proposed": {"frontier": deep, "deep": deep,
                          "standard": standard, "light": light},
             "note": note}
+
+
+# Effort vocabulary this project actually routes on (compound-v-resolve-model.py:EFFORTS
+# plus xhigh, which is codex-only there). Anything else a catalog lists (e.g. codex's
+# `max`/`ultra`) is surfaced via `efforts_not_adopted`, never silently dropped.
+_ADOPTED_EFFORTS = frozenset(("low", "medium", "high", "xhigh"))
+
+
+def _codex_family_of(slug):
+    """'gpt-6-astra' -> 'gpt-6'; 'gpt-5.5' -> 'gpt-5.5' (no alphabetic suffix to strip)."""
+    if "-" in slug:
+        prefix, suffix = slug.rsplit("-", 1)
+        if suffix.isalpha():
+            return prefix
+    return slug
+
+
+def propose_codex(catalog):
+    """Propose a frontier/deep/standard/light map from `codex debug models`' raw JSON.
+
+    `catalog` is the parsed JSON: on codex-cli 0.156.1 (live-checked 2026-09-24 for this
+    change) `codex debug models` actually prints a top-level OBJECT, ``{"models": [...]}``
+    -- not a bare array as an earlier description of this command claimed. Both shapes
+    are accepted here (a bare list, or a dict with a "models" list) so a future/older
+    codex-cli that does emit a bare array still works. See the module docstring's
+    "Ranking (codex, ...)" section for the full rule. Returns the same shape as
+    `propose()` (`available`, `proposed`, `note`) plus two codex-specific keys,
+    `retiring` and `efforts_not_adopted`.
+    """
+    if isinstance(catalog, dict):
+        catalog = catalog.get("models") or []
+    if not isinstance(catalog, list):
+        catalog = []
+    visible = [e for e in catalog if isinstance(e, dict) and e.get("visibility") == "list"]
+
+    def _efforts(entry):
+        return [lvl.get("effort") for lvl in (entry.get("supported_reasoning_levels") or [])
+                if isinstance(lvl, dict) and lvl.get("effort")]
+
+    available = [
+        {
+            "slug": e.get("slug"),
+            "description": e.get("description"),
+            "priority": e.get("priority"),
+            "default_reasoning_level": e.get("default_reasoning_level"),
+            "efforts": _efforts(e),
+        }
+        for e in visible
+    ]
+
+    def _retirement_at(e):
+        up = e.get("upgrade")
+        return up.get("retirement_at") if isinstance(up, dict) else None
+
+    retiring = [
+        {"slug": e.get("slug"), "retirement_at": _retirement_at(e),
+         "upgrade_model": (e.get("upgrade") or {}).get("model")}
+        for e in visible if _retirement_at(e)
+    ]
+
+    not_adopted = set()
+    for e in visible:
+        for eff in _efforts(e):
+            if eff not in _ADOPTED_EFFORTS:
+                not_adopted.add(eff)
+    efforts_not_adopted = sorted(not_adopted)
+
+    candidates = [e for e in visible if not _retirement_at(e)]
+    if not candidates:
+        return {"available": available, "proposed": None,
+                "note": "no non-retiring listed codex models in catalog",
+                "retiring": retiring, "efforts_not_adopted": efforts_not_adopted}
+
+    families = {}
+    for e in candidates:
+        families.setdefault(_codex_family_of(e.get("slug", "")), []).append(e)
+
+    def _min_priority(members):
+        prios = [m.get("priority") for m in members if isinstance(m.get("priority"), (int, float))]
+        return min(prios) if prios else float("inf")
+
+    winning_family = min(families, key=lambda fam: _min_priority(families[fam]))
+    ordered = sorted(
+        families[winning_family],
+        key=lambda m: m.get("priority") if isinstance(m.get("priority"), (int, float)) else float("inf"),
+    )
+
+    frontier = ordered[0]["slug"]
+    deep = ordered[1]["slug"] if len(ordered) >= 2 else ordered[0]["slug"]
+    standard = deep
+    light = ordered[-1]["slug"]
+
+    return {
+        "available": available,
+        "proposed": {"frontier": frontier, "deep": deep, "standard": standard, "light": light},
+        "note": "",
+        "retiring": retiring,
+        "efforts_not_adopted": efforts_not_adopted,
+    }
 
 
 def write_config(config_path, backend, tier_map):
@@ -217,7 +355,7 @@ def _selftest():
     check("still proposes something", r3["proposed"] is not None)
     check("proposal carries every tier the resolver knows",
           set(r3["proposed"]) == {"frontier", "deep", "standard", "light"})
-    check("frontier mirrors deep for an external backend",
+    check("frontier mirrors deep for a no-top-rung catalog (this ranker only, not codex)",
           r3["proposed"]["frontier"] == r3["proposed"]["deep"])
 
     check("empty catalog -> None", propose([], "Gemini")["proposed"] is None)
@@ -291,6 +429,93 @@ def _selftest():
     finally:
         os.unlink(path)
 
+    # --- codex: `codex debug models` JSON catalog (trimmed fixture off the 2026-09-24
+    # probe on codex-cli 0.156.1 -- see compound-v-resolve-model.py's _CODEX comment for
+    # the same facts). Only the fields propose_codex() reads are included.
+    def _lvls(*efforts):
+        return [{"effort": e, "description": e} for e in efforts]
+
+    codex_catalog = [
+        {"slug": "gpt-6-astra", "description": "Frontier intelligence for the most demanding work.",
+         "visibility": "list", "priority": 1, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium", "high", "xhigh", "max", "ultra"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-6-sol", "description": "Workhorse model for coding and everyday work.",
+         "visibility": "list", "priority": 2, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium", "high", "xhigh", "max", "ultra"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-6-luna", "description": "Fast and affordable model for easier tasks.",
+         "visibility": "list", "priority": 3, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium", "high", "xhigh", "max"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-5.6-sol", "description": "Older workhorse model for coding.",
+         "visibility": "list", "priority": 4, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium", "high", "xhigh"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-5.6-terra", "description": "Older mid-tier model.",
+         "visibility": "list", "priority": 7, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium", "high"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-5.6-luna", "description": "Older fast model.",
+         "visibility": "list", "priority": 8, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low", "medium"),
+         "default_reasoning_level": "low"},
+        {"slug": "gpt-5.5", "description": "Retiring model.",
+         "visibility": "list", "priority": 12,
+         "upgrade": {"model": "gpt-5.6-sol", "migration_markdown": "...",
+                     "retirement_at": "2026-10-14"},
+         "supported_reasoning_levels": _lvls("low", "medium", "high"),
+         "default_reasoning_level": "medium"},
+        {"slug": "gpt-reserve", "description": "Internal reserve.",
+         "visibility": "hide", "priority": 0, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low"), "default_reasoning_level": "low"},
+        {"slug": "codex-auto-review", "description": "Internal auto-review.",
+         "visibility": "hide", "priority": 0, "upgrade": None,
+         "supported_reasoning_levels": _lvls("low"), "default_reasoning_level": "low"},
+    ]
+
+    rc = propose_codex(codex_catalog)
+    rc_wrapped = propose_codex({"models": codex_catalog})
+    check("codex: accepts the real {'models': [...]} wrapper shape",
+          rc_wrapped["proposed"] == rc["proposed"])
+    check("codex: proposes exactly the maintainer's map",
+          rc["proposed"] == {"frontier": "gpt-6-astra", "deep": "gpt-6-sol",
+                             "standard": "gpt-6-sol", "light": "gpt-6-luna"})
+    check("codex: retiring model excluded from proposal",
+          "gpt-5.5" not in rc["proposed"].values())
+    check("codex: retiring model reported in retiring",
+          any(r["slug"] == "gpt-5.5" and r["retirement_at"] == "2026-10-14"
+              and r["upgrade_model"] == "gpt-5.6-sol" for r in rc["retiring"]))
+    check("codex: hidden models excluded from available",
+          all(a["slug"] not in ("gpt-reserve", "codex-auto-review") for a in rc["available"]))
+    check("codex: hidden models excluded from proposal",
+          all(v not in ("gpt-reserve", "codex-auto-review") for v in rc["proposed"].values()))
+    check("codex: efforts_not_adopted is exactly max/ultra, sorted+deduped",
+          rc["efforts_not_adopted"] == ["max", "ultra"])
+
+    # single listed model -> every tier maps to it
+    one_model = [
+        {"slug": "solo-model", "description": "Only model.", "visibility": "list",
+         "priority": 1, "upgrade": None, "supported_reasoning_levels": _lvls("low", "medium"),
+         "default_reasoning_level": "medium"},
+    ]
+    ro = propose_codex(one_model)
+    check("codex: single-model catalog maps every tier to it",
+          set(ro["proposed"].values()) == {"solo-model"})
+
+    # write_config works for codex too, via the same per-stance-aware logic
+    fd, path3 = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.unlink(path3)  # write_config must work when the config file doesn't exist yet
+    try:
+        write_config(path3, "codex", rc["proposed"])
+        with open(path3) as fh:
+            got3 = json.load(fh)
+        check("codex: write_config writes the proposed map",
+              got3["models"]["codex"] == rc["proposed"])
+    finally:
+        os.unlink(path3)
+
     print("SELFTEST: %d ok, %d fail" % (ok, fail))
     return 0 if fail == 0 else 1
 
@@ -309,13 +534,28 @@ def main(argv):
     if args.selftest:
         return _selftest()
 
-    if args.from_file:
-        with open(args.from_file, "r", errors="replace") as fh:
-            lines = fh.read().splitlines()
+    if args.backend == "codex":
+        # codex's catalog is a JSON array (from `codex debug models`), not a plain
+        # line-per-model text catalog -- read it whole and parse as JSON.
+        if args.from_file:
+            with open(args.from_file, "r", errors="replace") as fh:
+                raw = fh.read()
+        else:
+            raw = sys.stdin.read()
+        try:
+            catalog = json.loads(raw)
+        except ValueError as e:
+            print("discover: --backend codex expects the JSON array from "
+                  "`codex debug models`: %s" % e, file=sys.stderr)
+            return 1
+        result = propose_codex(catalog)
     else:
-        lines = sys.stdin.read().splitlines()
-
-    result = propose(lines, family=args.family)
+        if args.from_file:
+            with open(args.from_file, "r", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        else:
+            lines = sys.stdin.read().splitlines()
+        result = propose(lines, family=args.family)
     result["backend"] = args.backend
 
     if args.write_config:

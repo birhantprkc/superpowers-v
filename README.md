@@ -20,7 +20,7 @@ Every write is checked against the files that worker was allowed to touch, and a
 
 **Other model CLIs are optional.** Install and log into them and Compound V picks them up; without them it runs Claude-only.
 
-- **Codex** (≥ 0.144.6, for the gpt-5.6 family): `npm i -g @openai/codex` → `codex login`
+- **Codex** (≥ 0.156.1, for the gpt-6 family): `npm i -g @openai/codex` → `codex login`
 - **Cursor:** `curl https://cursor.com/install -fsS | bash` → `cursor-agent login`
 - **Antigravity:** install the `agy` CLI → log in
 

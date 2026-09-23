@@ -26,7 +26,8 @@ Invariants enforced (from PRD §5.1/§5.5 + plan §5/§6)
    If present, ``tier`` ∈ {frontier, deep, standard, light} and ``effort`` ∈
    {low, medium, high, xhigh}. ``effort: xhigh`` is valid iff
    ``backend: codex`` (codex's kernel model_reasoning_effort accepts it —
-   live-verified 2026-07-11 on codex-cli 0.144.1); any other backend with
+   verified 2026-07-11 on codex-cli 0.144.1, re-verified 2026-09-24 on 0.156.1);
+   any other backend with
    xhigh is a violation naming the rule.
 
 Required-field + enum validation (before invariant checks)
@@ -776,8 +777,9 @@ REVIEWER_TOKENS = ("review", "reviewer", "spec_review", "quality", "integration"
 
 # Intent vocabulary (mirrors compound-v-resolve-model.py). Stable; never
 # changes when concrete models churn. `xhigh` is valid iff backend == "codex"
-# (codex's kernel model_reasoning_effort accepts it — live-verified 2026-07-11
-# on codex-cli 0.144.1); validate() rejects xhigh on every other backend.
+# (codex's kernel model_reasoning_effort accepts it — verified 2026-07-11 on
+# codex-cli 0.144.1, re-verified 2026-09-24 on 0.156.1); validate() rejects
+# xhigh on every other backend.
 # `frontier` (v3.0.5) is the extreme seat — on claude it resolves to Fable. It is
 # what a failed re-attempt escalates INTO; a planner assigning it up front is
 # valid but unusual. Reviewers are NOT satisfied by it: Invariant 3 still
@@ -4033,7 +4035,7 @@ jobs:
     title: "opencode slice"
     type: large_isolated
     backend: opencode
-    model: "gpt-5.6"
+    model: "gpt-6"
     isolation: worktree
     run: serial
     write_allowed: [src/opencode/**]
@@ -5262,7 +5264,7 @@ def _selftest():
     # explicit model override is REJECTED before dispatch.
     opencode_bare_bad = validate_text(OPENCODE_BARE_MODEL_MANIFEST)
     expect(
-        "bare opencode model 'gpt-5.6' REJECTED (not provider/model)",
+        "bare opencode model 'gpt-6' REJECTED (not provider/model)",
         any("not a valid 'provider/model' string" in p for p in opencode_bare_bad),
     )
     opencode_malformed_bad = validate_text(OPENCODE_MALFORMED_MODEL_MANIFEST)

@@ -111,7 +111,7 @@ MAX_PROMPT_CHARS = 8000            # hard ceiling on the whole assembled prompt
 # Codex route bounds.
 CODEX_TIMEOUT_S = 30               # wall-clock cap for the one-shot classify
 CODEX_STDOUT_CAP = 1 << 16        # bounded output sink for codex's event stream (CR5-8)
-DEFAULT_CODEX_LIGHT_MODEL = "gpt-5.6-luna"   # fallback iff the resolver is unavailable
+DEFAULT_CODEX_LIGHT_MODEL = "gpt-6-luna"   # fallback iff the resolver is unavailable
 TIMEOUT_EXIT_CODE = 124           # GNU-timeout / supervisor convention
 NOT_FOUND_EXIT_CODE = 127         # the supervisor's "command does not exist" convention
 

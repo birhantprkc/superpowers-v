@@ -35,7 +35,7 @@ of this repo.
   "prompt": "…",                       // the worker prompt (opens with the planner/executor lock, below)
   "tier": "standard",                  // frontier | deep | standard | light — the routing INTENT (stable across model churn)
   "effort": "medium",                  // low | medium | high | xhigh — orthogonal reasoning-effort hint (optional; xhigh is codex-only)
-  "model": "gpt-5.6-sol",                  // OPTIONAL explicit override; when present it skips resolution.
+  "model": "gpt-6-sol",                  // OPTIONAL explicit override; when present it skips resolution.
                                        //   execution-layer data — NEVER appears in any frontmatter
   "cwd": "/repo",                      // absolute repo root
   "write_allowed": ["src/features/sequences/components/**"],
@@ -318,7 +318,7 @@ This is the *instructed* half. The git-diff scope gate above is the *enforced* h
 
 ---
 
-## Pinned `codex exec` flag set (verified live against codex-cli 0.144.1)
+## Pinned `codex exec` flag set (verified live against codex-cli 0.144.1, re-verified 2026-09-24 on 0.156.1)
 
 The codex adapter MUST use exactly this flag set, launched **under the process-group supervisor with `stdin </dev/null`** per the non-negotiable rule above (never a bare `timeout … codex exec`):
 

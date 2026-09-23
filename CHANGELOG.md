@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.7.1] - 2026-09-24
+
+### Changed — Codex defaults move to the GPT-6 family, review runs on Astra, and Codex can be discovered
+
+**Probed, not read.** On 2026-09-24, codex-cli 0.156.1's own catalog (`codex debug models`) lists the GPT-6 family
+that reached Codex on 2026-09-22/23: `gpt-6-astra` ("Frontier intelligence for the most demanding work"),
+`gpt-6-sol` ("Workhorse model for coding and everyday work") and `gpt-6-luna` ("Fast and affordable model for
+easier tasks"). There is no `gpt-6-terra`. The GPT-5.6 trio is still listed and now described as "Older"; `gpt-5.5`
+retires on 2026-10-14. All three GPT-6 models answered a `codex exec` run with this repository's pinned flag set at
+`model_reasoning_effort=xhigh` — rc 0, `thread.started` present, last message written — so the flag set first
+verified on 0.144.1 is re-verified on 0.156.1.
+
+**The default map** becomes `frontier` → `gpt-6-astra`, `deep` → `gpt-6-sol`, `standard` → `gpt-6-sol`,
+`light` → `gpt-6-luna` (was sol/sol/terra/luna of GPT-5.6, 2026-07-10). `deep` and `standard` share a model and
+differ on the orthogonal effort axis. **Every Codex review and judge role now resolves tier `frontier`** — the
+cross-model plan review, the second opinion and the epic arbiter — because review is where the strongest reasoning
+pays and implementation stays on the workhorse. Manifest `model` overrides and `.claude/compound-v.json` maps are
+untouched by this: the call sites pass a tier, never a literal.
+
+**Codex has a model list command now.** Every document that said "Codex has no list command, so its map is
+curated" was true when written and is false today. `/v:models` §1b discovers Codex the way §1c discovers
+Antigravity: `codex debug models | compound-v-discover-models.py --backend codex` keeps the listed models, drops
+the retiring ones, picks the newest family by the catalog's own priority and proposes the four tiers; it also
+reports `retiring` and `efforts_not_adopted`.
+
+**Two effort levels seen and not adopted.** GPT-6 accepts `max`, and Astra and Sol accept `ultra` — "Maximum
+reasoning with automatic task delegation". Compound V's vocabulary stays `low|medium|high|xhigh`: `ultra` would
+have the worker delegate to sub-agents of its own, whose writes land outside the job's lane, invisible to the lane
+guard and BLOCKED by the scope gate; `max` is simply not adopted this release. Both are named in the routing policy
+so nobody rediscovers them by accident.
+
 ## [3.7.0] - 2026-09-21
 
 ### Added — five native Claude Code mechanisms from the 2.1.261–2.1.278 changelogs, taken where they replace something we did by hand

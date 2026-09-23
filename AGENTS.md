@@ -57,7 +57,7 @@ The execution tail is a small, deterministic orchestrator — contracts + helper
 
 - **Manifest contract:** `skills/compound-v/execution-manifest.md` (schema) + `examples/manifest.example.yaml`.
 - **Backend Launcher sub-skill:** `skills/backend-launcher/SKILL.md` defines one `job_spec → job_result` contract (`schemas/job_result.schema.json`). Adapters: `adapter-claude.md`, `adapter-codex.md`, `adapter-antigravity.md` (1.1: a **real** headless `agy --print` worker — same worktree + `git diff` scope gate as Codex, but **opt-in / lower-trust**: `agy` has no kernel write-confinement, so the gate *detects* in-worktree scope leaks yet cannot *prevent* an out-of-worktree side-effect — **prefer Codex for untrusted work**), and `adapter-cursor.md` (2.1: a headless `cursor-agent -p -f` worker, verified live, same worktree + scope gate — also opt-in / lower-trust, same caveat as Antigravity; needs an authenticated `cursor-agent`).
-- **Headless Codex worker:** `scripts/compound-v-run-codex-worker.sh`. The verified `codex-cli 0.144.1` invocation runs in a git worktree (with `--json` for structured `thread.started` session-id capture as of v2.8.1):
+- **Headless Codex worker:** `scripts/compound-v-run-codex-worker.sh`. The verified `codex-cli 0.144.1` invocation (verified 2026-07-11 on 0.144.1, re-verified 2026-09-24 on 0.156.1 with `gpt-6-sol`/`gpt-6-luna`) runs in a git worktree (with `--json` for structured `thread.started` session-id capture as of v2.8.1):
 
   ```bash
   codex exec --cd "$WT" --sandbox workspace-write --skip-git-repo-check \
@@ -149,7 +149,7 @@ turns it off everywhere and the agents run exactly as they did before 3.5.0.
 | `/v:collect <run-id>` | Re-run collect + scope-gate + review on an existing run |
 | `/v:status [run-id]` | Render `state.json` |
 | `/v:resume <run-id>` | Reconcile + re-dispatch incomplete jobs after interruption |
-| `/v:models` | Discover models per backend (`agy models`, curated Codex list, native Claude tiers) and write the tier→model map into `.claude/compound-v.json` |
+| `/v:models` | Discover models per backend (`agy models`, `codex debug models`, native Claude tiers) and write the tier→model map into `.claude/compound-v.json` |
 | `/v:review-plan <plan>` | Optional cross-model (Codex) second opinion on a high-stakes plan before dispatch — read-only, advisory; the orchestrator arbitrates |
 | `/v:epic <brief>` | Chain several features into one autonomous, resumable, dependency-ordered build on a single branch; each feature runs the full pipeline in topological order, ending with a cross-feature integration review |
 | `/v:remember <query>` | Recall search over `docs/superpowers/**` prose (V-memory) — evidence for planning + review, not a routing input |
