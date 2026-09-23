@@ -37,6 +37,12 @@ have the worker delegate to sub-agents of its own, whose writes land outside the
 guard and BLOCKED by the scope gate; `max` is simply not adopted this release. Both are named in the routing policy
 so nobody rediscovers them by accident.
 
+**Fixed — recall evidence order depended on the filesystem.** `compound-v-memory.py recall-check` listed
+failure records in `os.walk` order (sorted on APFS, hash order on ext4) and the emitter keeps the first three,
+so the prior-failure evidence an implementer saw could differ between a Mac and CI — the 3.7.1 CI run caught it
+when a selftest that had always passed on macOS failed on Linux. Records are now ordered newest run first, by
+the date-prefixed run directory, ties by record path.
+
 ## [3.7.0] - 2026-09-21
 
 ### Added — five native Claude Code mechanisms from the 2.1.261–2.1.278 changelogs, taken where they replace something we did by hand

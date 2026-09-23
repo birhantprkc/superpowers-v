@@ -9666,7 +9666,8 @@ def selftest():
                and "at most 20 reading calls" in _rk_prompt
                and "never" in _rk_prompt and "top to bottom" in _rk_prompt
                and "commit what is complete" in _rk_prompt
-               and "run-0/results/j.json" in _rk_prompt, _rk_prompt[-900:])
+               and "run-3/results/j.json" in _rk_prompt
+               and "run-0/results/j.json" not in _rk_prompt, _rk_prompt[-900:])
         _check("...with a reading budget attached to it",
                "READING BUDGET" in _rk_prompt)
         _check("...and hands the verdict back through register-lane",

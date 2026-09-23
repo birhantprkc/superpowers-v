@@ -1073,6 +1073,12 @@ def scan_failures(results_root):
                 continue
             out.append({"run": os.path.relpath(os.path.join(dirpath, f), results_root),
                         "status": rec.get("status"), "files": [str(x) for x in files_changed]})
+    # os.walk order is the filesystem's: sorted on APFS, hash order on ext4. The
+    # emitter keeps only the first RECALL_EVIDENCE_MAX matches, so an unsorted
+    # list made the evidence a job saw depend on the machine (CI, 2026-09-24).
+    # Newest run first — run directories are date-prefixed, so lexical descending
+    # is chronological — and the record path breaks ties.
+    out.sort(key=lambda r: r["run"], reverse=True)
     return out
 
 
@@ -1427,6 +1433,18 @@ def _selftest() -> int:
                        "files_changed": ["src/ui/button.tsx"], "violations": []}, fh)
         v = recall_check(["src/api/*.ts"], os.path.join(docs, "execution"), RECALL_K)
         check("recall tighten on repeated failure", v["verdict"] == "tighten" and v["match_count"] == 2)
+        # Evidence order must not depend on the filesystem: newest run first, by
+        # the date-prefixed run directory (the emitter keeps only the first few).
+        _ord_root = os.path.join(tmp, "ordered-results")
+        for _run in ("2026-02-02-mid", "2026-03-03-new", "2026-01-01-old"):
+            _rp = os.path.join(_ord_root, _run, "results")
+            os.makedirs(_rp, exist_ok=True)
+            with open(os.path.join(_rp, "j.json"), "w") as fh:
+                json.dump({"job_id": "j", "status": "blocked", "blocked": True,
+                           "violations": ["src/api/x.ts"]}, fh)
+        _ord = [r["run"].split("/")[0] for r in scan_failures(_ord_root)]
+        check("scan_failures orders records newest run first, independent of walk order",
+              _ord == ["2026-03-03-new", "2026-02-02-mid", "2026-01-01-old"])
         v2 = recall_check(["src/ui/*.tsx"], os.path.join(docs, "execution"), RECALL_K)
         check("recall none on success file", v2["verdict"] == "none")
         v3 = recall_check(["src/api/*.ts"], os.path.join(docs, "execution"), 5)
