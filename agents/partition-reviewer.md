@@ -31,6 +31,14 @@ declares:
 python3 "$CV/scripts/compound-v-memory.py" recall-check --files <every write_allowed glob>
 ```
 
+**Nothing injects recall into your prompt; run the bridge yourself.** Emit-time recall
+reaches the implementers (`## Prior failures on your lane`), the Engine C review jobs and
+the three pre-flight auditors (`## Prior context from this repository (V-memory)`). You run
+before emit: `/v:dispatch` spawns you as a subagent, and no emitter writes your prompt.
+Nothing in the pipeline hands you a block, so the command above is your recall and not a
+fallback. If a caller did paste a `## Prior context` block into your prompt, read it as
+evidence under the rules below.
+
 If a lane's file pattern carries repeated prior `blocked` / `error` / `timeout` or
 scope-violation records, the verdict is **`tighten`**: force `worktree` isolation on
 that job, add a review pass, or fold the contested paths into Task 0. A partition

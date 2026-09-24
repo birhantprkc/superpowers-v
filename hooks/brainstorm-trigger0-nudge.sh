@@ -36,6 +36,20 @@
 # Hook input format (Claude Code spec): JSON on stdin with tool_name and
 # tool_input; the Skill tool's input carries the skill name in tool_input.skill.
 # Output format: JSON on stdout with hookSpecificOutput.additionalContext.
+#
+# RECALL (v3.7.2). The reminder used to end at "search V-memory first" — prose an
+# agent may skip, and an audit of 369 real searches found about 1% of results
+# visibly used. So when the Skill call carries a topic (tool_input.args), this hook
+# RUNS the V-memory search itself and appends up to 3 hits to the reminder, in the
+# same framed block the pre-flight and review prompts carry (rendered by
+# scripts/compound-v-emit-preflight.py --recall-query, the one renderer). No args
+# -> no search, today's reminder only. The budget: the engine call is capped at
+# 3 s inside the helper (FTS5 lane only, --no-refresh, so a cold embedder or a
+# refresh holding the lock cannot eat it) and the helper itself at 4 s here; the
+# registration carries no `timeout`, so these are the bounds. Any failure — no
+# python3, no engine, no index, a timeout, garbage — drops the block and keeps
+# the reminder. Never blocks, never prints outside the JSON, always exits 0.
+# CV_MEMORY_ENGINE overrides the engine path (tests point it at a fake).
 
 set -euo pipefail
 if [ "${CV_HEADLESS_CLASSIFY:-}" = "1" ]; then exit 0; fi  # finding 131: never fire inside the headless classifier
@@ -50,6 +64,9 @@ input="$(cat)"
 # or if stdin is not valid JSON.
 tool_name=$(echo "$input" | jq -r '.tool_name // empty' 2>/dev/null || echo "")
 skill_name=$(echo "$input" | jq -r '.tool_input.skill // empty' 2>/dev/null || echo "")
+# The topic the skill was invoked with — a string only; anything else is no topic.
+topic=$(echo "$input" | jq -r 'if (.tool_input.args|type) == "string" then .tool_input.args else empty end' 2>/dev/null || echo "")
+hook_cwd=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null || echo "")
 
 # Fire only for the Skill tool
 [ "$tool_name" = "Skill" ] || exit 0
@@ -65,6 +82,60 @@ case "$skill_name" in
     exit 0
     ;;
 esac
+
+# Run a command with a wall-clock bound, portably (macOS has no timeout(1)): a
+# background child plus a polling waiter, TERM then KILL. Same shape as
+# precompact-snapshot.sh's _bounded. Prints the child's stdout only on rc 0.
+_bounded() {
+  local limit_tenths="$1"; shift
+  local out rc waited pid grace
+  out="$(mktemp "${TMPDIR:-/tmp}/cv-t0-recall.XXXXXX" 2>/dev/null)" || return 1
+  ( "$@" >"$out" 2>/dev/null ) &
+  pid=$!
+  waited=0
+  while [ "$waited" -lt "$limit_tenths" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null
+    grace=0
+    while [ "$grace" -lt 5 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+      grace=$((grace + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+    rm -f "$out" 2>/dev/null
+    return 1
+  fi
+  rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$out" 2>/dev/null; return 1; fi
+  cat "$out" 2>/dev/null
+  rm -f "$out" 2>/dev/null
+  return 0
+}
+
+recall_block=""
+if [ -n "$topic" ] && command -v python3 >/dev/null 2>&1; then
+  plugin_root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
+  helper="$plugin_root/scripts/compound-v-emit-preflight.py"
+  engine="${CV_MEMORY_ENGINE:-$plugin_root/scripts/compound-v-memory.py}"
+  if [ -f "$helper" ]; then
+    set -- python3 -B "$helper" "--recall-query=$topic" --recall-engine "$engine" \
+      --recall-top 3 --recall-timeout 3 --no-embed
+    if [ -n "$hook_cwd" ] && [ -d "$hook_cwd" ]; then set -- "$@" --repo "$hook_cwd"; fi
+    recall_block=$(PYTHONDONTWRITEBYTECODE=1 _bounded 40 "$@" || true)
+  fi
+fi
+if [ -n "$recall_block" ]; then
+  nudge="$nudge
+
+$recall_block"
+fi
 
 # Emit context-injection JSON per platform
 if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then

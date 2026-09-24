@@ -411,3 +411,27 @@ Fall back to default Superpowers for those. Document the fallback at the top of 
 **Symptom:** `a plugin directory holds more than 20000 entries`, `Not logged in · Please run /login`, or a Bash-sandbox refusal naming a symbolic link under `~/.docker`.
 
 **Cause and fix:** (1) stale `.claude/worktrees/` from earlier pipeline runs push the checkout over the eval harness's 20 000-entry scan limit — `git worktree list` and remove the ones with no commits ahead of `main`, or run the suite from a copy without `.git/` and `.claude/worktrees/`; (2) the CLI must be signed in (`claude auth status`) — a desktop-app session's login does not carry over to a nested `claude` process; (3) `find ~/.docker -type l` names the link the sandbox refuses; the harness documents this precondition nowhere, so it is recorded here.
+
+## V-memory finds nothing for a Russian question, or for a paraphrase
+
+**Symptom:** `/v:remember` (or `search`) misses an obviously related document when the question is in another language than the docs, or uses none of their words.
+
+**Cause:** neither lane crosses that gap on this corpus. FTS5 matches words (Porter stemming, English only). The dense lane was expected to, and was measured not to: on the plugin's own repo, pure-Russian questions score 0/4 with and without it, because `multilingual-e5-small` pulls every Russian question towards the same few Russian-language documents; paraphrases score 0/3 either way (`skills/compound-v/memory.md` § Recall benchmark).
+
+**Fix:** ask in English, keeping identifiers, flags and error strings verbatim — `/v:remember` now translates a non-English question itself and searches both forms (the same four questions went from 0/4 to 2/4). If a doc still does not surface, name one of its words: a flag, a file, an error message. To see which lane answered, read `doctor`'s `mode` line — "bootstrapped" alone only means the venv exists; the dense lane also needs `memory.embeddings: true` in `.claude/compound-v.json` and at least 80 vectors.
+
+## `sqlite3` on this machine has no FTS5
+
+**Symptom:** `doctor` prints `sqlite FTS5 : MISSING — …` and exits non-zero, or (on an older engine that didn't check yet) `refresh`/`search` raises a `sqlite3.OperationalError` mentioning `fts5`; a background `memory-refresh.sh` hook never builds an index either way (it redirects all output by design, so it never surfaces this on its own — run `refresh` yourself in the foreground to see it).
+
+**Cause:** V-memory's FTS5 lane needs a `python3` whose linked `sqlite3` library was compiled with the FTS5 extension. Most `python.org` and Homebrew builds have it; some Linux distro packages of Python (and some very old macOS system pythons) don't.
+
+**Fix:** `doctor`'s own message already names the fix — point at a `python3` that has FTS5: stock macOS `/usr/bin/python3` (Apple's system Python ships it), a python.org installer build, or a Homebrew build (`brew install python3`). Either put it first on `PATH` or invoke it explicitly: `/path/to/python3 scripts/compound-v-memory.py refresh`. To check a candidate interpreter by hand: `python3 -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)'); print('FTS5 OK')"`. There is no code-level fallback: the engine is pure-stdlib by design (see `CONVENTIONS.md` §"Python: stdlib only"), so this is a "use a different interpreter" fix, not a config change.
+
+## `recall-check` says tighten on a lane that never actually failed
+
+**Symptom:** the deterministic recall→action bridge (`recall-check`, or the auto-tighten it drives at emit time) reports a `tighten` verdict for a file lane, but the prior runs it's counting weren't real content failures on that lane — they were a harness fault (an `error`/`timeout` job_result — out of credits, network, a crashed worker), a test-supervisor timeout, or a run the team has already flagged as not representative.
+
+**Cause:** the engine only counts a `job_result` as evidence when the failure is attributable to the *job's own work* — a real scope violation (`violations` non-empty) or a real test failure (`tests.exit_code` nonzero and not the supervisor's own timeout code). Everything else is tallied separately as excluded and never taught to recall: a harness fault (`status` `error`/`timeout`), a test-supervisor timeout, a violation that only touched the run's own bookkeeping files (`state.json`, `preexisting/`, a baseline), an unattributed `blocked` with nothing to point at — or a run whose own `manifest.yaml` carries a top-level `recall_exclude: true`, the explicit "this was a deliberately planted failure (a dogfood probe), don't teach recall from it" escape hatch. See [`memory.md`](skills/compound-v/memory.md) for the full attribution table.
+
+**Fix:** if a specific run's `job_result.json` genuinely wasn't a content failure and isn't already excluded by the rules above, set `recall_exclude: true` at the top level of that run's `manifest.yaml`, then re-run `recall-check` — the verdict is deterministic and re-derives cleanly from the same evidence. Don't hand-edit the `tighten`/`none` verdict itself; edit the manifest that the attribution reads.

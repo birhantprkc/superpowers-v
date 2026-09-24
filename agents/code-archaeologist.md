@@ -17,15 +17,26 @@ You may be running in parallel with the domain-expert advisor (Phase 1B) and the
 
 ## Step 0 — ask what this project already knows (V-memory)
 
-**Before you read a single file, ask the recall layer.** This repository keeps its
-own prose — specs, ADRs, architecture notes, dogfood records of what actually broke
-— and it is searchable. Rediscovering something already written down is the most
-common way an audit wastes its budget and, worse, contradicts a decision nobody
-told you about.
+**Before you read a single file, read what the recall layer already found.** This
+repository keeps its own prose — specs, ADRs, architecture notes, dogfood records of
+what actually broke — and it is searchable. Rediscovering something already written
+down is the most common way an audit wastes its budget and, worse, contradicts a
+decision nobody told you about.
 
-The script ships with the plugin, not with this repository. Resolve the plugin root once
-per session before calling it — `CLAUDE_PLUGIN_ROOT` is set for hooks but is not set in this
-Bash environment, so treat it as a hint, never the whole answer:
+**Launched through the pipeline, your prompt already carries the recall.**
+`scripts/compound-v-emit-preflight.py` runs one V-memory search at emit time, keyed on
+the spec's title and first paragraph, and puts the hits in your prompt under
+`## Prior context from this repository (V-memory)`. All three pre-flight auditors get the
+same block, and the emitted pre-flight records what it showed (`CFG.recall`). Start
+from that block. It is one phrasing, so search again with another phrasing when your
+budget allows.
+
+**Fallback: if your prompt has no `## Prior context` block**, run the search yourself. The
+block is missing when the engine or its index was unavailable at emit time (the plan
+records `recall: unavailable (<reason>)`) or when you were launched by hand. The script
+ships with the plugin, not with this repository. Resolve the plugin root once per session
+before calling it. `CLAUDE_PLUGIN_ROOT` is set for hooks but is not set in this Bash
+environment, so treat it as a hint, never the whole answer:
 
 ```bash
 CV="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$HOME"/.claude/plugins/cache/*/superpowers-v/*/ 2>/dev/null | sort -V | tail -1)}"

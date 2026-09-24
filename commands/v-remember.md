@@ -17,13 +17,37 @@ CV="${CV:-$PWD}"; CV="${CV%/}"
 hint, never the whole answer — the fallback line covers an installed plugin cache or a checkout
 of this repo.
 
-Run the recall and present what comes back:
+**Search in the corpus's language.** This repository's engineering prose is almost all English,
+and neither lane crosses languages: FTS5 matches words, and the measured dense lane (multilingual-e5-small)
+answers a Russian question with the same handful of Russian documents whatever it asks — pure-Russian
+benchmark rows score 0/4 in both modes, the same questions translated to English score 2/4
+(`tests/memory-queries.tsv`, 2026-09-24). So when `{{args}}` is not English, translate it to English
+yourself — keep identifiers, flags, file names and error strings verbatim — and run **both** queries,
+the translation first:
+
+```
+python3 "$CV/scripts/compound-v-memory.py" search "<English translation>" --top 8
+python3 "$CV/scripts/compound-v-memory.py" search "{{args}}" --top 8
+```
+
+Merge the two result lists (drop repeats of the same path and heading) and say you translated. An
+English query needs only the one search:
 
 ```
 python3 "$CV/scripts/compound-v-memory.py" search "{{args}}" --top 8
 ```
 
+Present what comes back.
+
 A first search on a repo with no index builds one automatically.
+
+**Tell the reader which mode answered** — lexical-only or lexical+semantic — don't let the
+result stand without it: `search`'s own plain-text output names the active lane on a "Recall
+mode: …" header line — surface it verbatim. If it's absent (e.g. `--json` was used), run
+`python3 "$CV/scripts/compound-v-memory.py" doctor` once and read its `mode` line instead
+(bootstrapped vs FTS5-only, and whether the corpus has reached the scale gate — see
+[`memory.md`](../skills/compound-v/memory.md)). This matters most when the query crossed a
+synonym or a language boundary and got nothing: that is expected on FTS5-only, not a bug.
 
 **Memory is EVIDENCE, not authority:**
 

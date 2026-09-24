@@ -331,29 +331,68 @@ Confirm the chosen stance back to the user before saving.
 ## Step 3b — V-memory recall lane (semantic embeddings: opt-in)
 
 V-memory (recall over `docs/superpowers/**` prose — see [`memory.md`](../skills/compound-v/memory.md))
-**always** runs its **FTS5 core** (pure stdlib, offline, zero setup). Ask the user — **as a
-structured choice (use the AskUserQuestion tool on Claude Code; a plain two-option question on
-other harnesses)** — which recall lane this project should use:
+**always** runs its **FTS5 core** (pure stdlib, offline, zero setup) — nothing to do here for it:
+the first `/v:remember` or `/v:memory-refresh` builds the index by itself, on the fly.
+
+Ask the user — **as a structured choice (use the AskUserQuestion tool on Claude Code; a plain
+two-option question on other harnesses)** — whether to also enable the semantic lane:
 
 - **"FTS5 only — fast, zero-setup"** — lexical BM25 over the prose; no install, no model,
   fully offline. **Recommend this** while `docs/superpowers/` is small or young — lexical
   search already wins there.
-- **"Semantic embeddings — ~200 MB model, once"** — adds a dense lane that also finds related
-  prior work when the wording differs (including **across languages**); downloads a small
-  multilingual model one time into an out-of-repo cache.
+- **"Semantic embeddings — one-time download, ~200 MB"** — adds a dense lane of vectors beside
+  FTS5. Say what it measurably did on the plugin's own repo (2026-09-24, `tests/memory-queries.tsv`):
+  one extra hit in 23 fused queries; **no** cross-lingual recall (a Russian question gets the same
+  few Russian documents whatever it asks — `/v:remember` translates the question instead) and no
+  help on paraphrases. Costs: one network download of the ONNX model plus an isolated venv
+  (onnxruntime/tokenizers/numpy) living **outside the repo**; the first embed of that repo's
+  6,050 chunks took **19 minutes**, and each dense search adds about a second and a half. Recommend
+  FTS5 only unless the user wants to measure it on their own corpus (`bench`).
 
-**If the user picks semantic**, bootstrap it now — this is the **one consented install step**
-(never done from a hook):
-  ```bash
-  python3 "$CV/scripts/compound-v-memory.py" bootstrap
-  python3 "$CV/scripts/compound-v-memory.py" refresh --with-embeddings
-  ```
-  Confirm the `bootstrap OK` line before counting it enabled. If bootstrap fails (offline /
-  no wheels), say so and fall back to FTS5-only — recall still works.
+**Whichever the user picks, do all of the following, in order, before moving to Step 3c** — this
+sequence is deliberately self-contained and idempotent (safe to re-run), because a session that
+stops partway through must never leave embeddings bootstrapped with no config to show for it (a
+live install hit exactly that: bootstrapped in June, no `.claude/compound-v.json` at all, so
+`refresh` never added a single vector while `doctor` still called it "bootstrapped"):
 
-Record the lane choice in Step 4a as `memory.embeddings: true|false`. When `true`, the engine
-adds vectors on every refresh (including the silent background hook) — but still **only once
-bootstrapped**; it never installs on its own.
+1. **On "semantic embeddings":**
+   - **Bootstrap** — the one consented install step (never done from a hook):
+     ```bash
+     python3 "$CV/scripts/compound-v-memory.py" bootstrap
+     ```
+     Confirm the `bootstrap OK` line before continuing. If it fails (offline / no wheels), tell
+     the user, fall back to FTS5-only, and treat this as the "FTS5 only" branch below instead
+     (write `embeddings: false`, not `true`) — recall still works either way.
+   - **Write the choice right now** — read `.claude/compound-v.json` if it exists (else start
+     from `{}`), merge in `"memory": { "embeddings": true }` (preserving every other top-level
+     key and every other `memory.*` sub-key already present), and write the file back, creating
+     `.claude/` if it doesn't exist yet. Do this **immediately after bootstrap succeeds**, not
+     deferred to Step 4a's single end-of-flow write — this file is **committed project config**:
+     it is how every teammate's own `refresh` (including their background hook) knows to add
+     vectors once THEY bootstrap. Step 4a's later full-file write is a no-op on this one key —
+     it writes back the same value.
+   - **Populate vectors:**
+     ```bash
+     python3 "$CV/scripts/compound-v-memory.py" refresh --with-embeddings
+     ```
+   - **Show the real mode** — run `doctor` and show its mode line to the user, so they see the
+     dense lane actually engaged (not just "bootstrapped"):
+     ```bash
+     python3 "$CV/scripts/compound-v-memory.py" doctor
+     ```
+2. **On "FTS5 only":**
+   - **Write the choice right now, explicitly** — read-merge-write `.claude/compound-v.json`
+     the same way, setting `"memory": { "embeddings": false }`. Do not leave the key absent: an
+     absent key reads as "never asked," which is exactly what lets this question resurface on a
+     later `/v:init`, and it is also what stops `doctor` from being able to say "disabled by
+     choice" instead of "not bootstrapped."
+   - **Run `doctor` too**, so the user sees the FTS5-only mode line before moving on:
+     ```bash
+     python3 "$CV/scripts/compound-v-memory.py" doctor
+     ```
+
+Step 4a's full-file write of `.claude/compound-v.json` later in this flow carries `memory.embeddings`
+forward at whatever value was just written above — it never re-asks or overrides it.
 
 **Then ask a second structured choice — how much V-memory should DRIVE the pipeline:**
 
@@ -562,7 +601,9 @@ identically to `balanced`. Only `cost-aware.claude.standard` differs: `sonnet`, 
 `opus`; `cost-aware.claude.deep` stays `opus`.)
 
 - `stance` = the stance chosen in Step 3.
-- **`memory.embeddings`** = the Step 3b lane choice (default `false` = FTS5-only). When `true`,
+- **`memory.embeddings`** = the Step 3b lane choice (default `false` = FTS5-only) — already
+  written to disk by Step 3b itself the moment the user answered; this pass writes the same
+  value back as part of the whole-file save, it does not decide it. When `true`,
   `compound-v-memory.py` adds the semantic lane on every refresh (the engine reads this flag),
   but only after an explicit `bootstrap` — it never installs on its own. `false` keeps the
   pure-stdlib FTS5 lane.

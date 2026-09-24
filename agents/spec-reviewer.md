@@ -33,7 +33,17 @@ of this repo.
 
 ## Step 0 — ask what this project already knows (V-memory)
 
-**Before reviewing, ask the recall layer**, at review intent:
+**Before reviewing, read what the recall layer already found.** Launched as an Engine C
+review job, your prompt already carries it: `scripts/compound-v-emit-workflow.py` runs one
+V-memory search at emit time (`--intent review`, keyed on the manifest's `feature` and its
+feature-level `acceptance_criteria`), and every review job's prompt carries the hits under
+`## Prior context from this repository (V-memory)`. The emit summary and your job entry
+(`recall_search`) record what it showed. Start from that block.
+
+**Fallback: if your prompt has no `## Prior context` block**, ask the recall layer yourself
+at review intent. The block is missing when the engine or its index was unavailable at
+emit time (`recall_search` says `recall: unavailable (<reason>)`), when recall was off for
+the run, or when you were launched outside Engine C:
 
 ```bash
 python3 "$CV/scripts/compound-v-memory.py" search "<the feature, in 3-8 words>" --intent review --top 8

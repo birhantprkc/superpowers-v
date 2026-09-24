@@ -40,6 +40,24 @@ If the project opted into embeddings at [`/v:init`](v-init.md) (`memory.embeddin
 bootstrapped — you don't need the flag. If `{{args}}` asks for `--with-embeddings` and
 `doctor` shows embeddings are not bootstrapped, run `bootstrap` first (tell the user it will
 download a ~200 MB model once).
+
+**`--with-embeddings` only does something once ALL THREE conditions hold** — say this plainly
+if `doctor` shows the dense lane inactive after a refresh:
+
+1. `bootstrap` has completed (out-of-repo venv present);
+2. `.claude/compound-v.json` has `memory.embeddings: true` (set at [`/v:init`](v-init.md) Step
+   3b, or by hand); and
+3. the corpus has reached the scale gate (a minimum vector count — dense stays dormant,
+   FTS5-only, below it, deliberately: on a handful of docs a full read or FTS5 already wins).
+
+`doctor`'s own `mode` line reports exactly which of the three is missing in plain language (e.g.
+"dense venv installed but disabled", "dense enabled but not bootstrapped", "below the scale
+gate (N vectors < gate)") — read that line rather than re-deriving the state from the other
+fields. Any one of the three missing ⇒ FTS5-only, silently and correctly. This is also the shape
+of the most common confusion: bootstrapped-but-not-configured (condition 2 missing) looks
+identical to "nothing happened" from the outside — the `mode` line is what tells them apart. See
+[`TROUBLESHOOTING.md`](../TROUBLESHOOTING.md) for that failure mode written out.
+
 The semantic lane is **scale-gated**: it only changes ranking once the corpus is large
 enough to matter; on a small corpus FTS5 already wins. If bootstrap fails (offline / no
 wheels), the engine stays FTS5-only — recall still works. See
