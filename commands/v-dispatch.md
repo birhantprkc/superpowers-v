@@ -411,6 +411,10 @@ of this repo. Paths under `docs/superpowers/` stay relative; only the plugin's o
    so many words — and its cleanup removes a worktree only when
    the path sits under `.worktrees/` or `worktrees/` (`SKILL.md:169-178`).)
 
+   In the final report, after a run with any BLOCKED or failed job, suggest
+   [`/v:lessons`](v-lessons.md) — it drafts a routing lesson when the same failure has recurred
+   across independent runs, and writes nothing until the human accepts it.
+
 ## Safety
 
 - Do NOT dispatch implementers if partition-reviewer returned FAIL.

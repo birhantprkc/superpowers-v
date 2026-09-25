@@ -79,6 +79,7 @@ Implementers and the spec-reviewer also call Claude Code's built-in `advisor` at
 | `/v:review-plan <plan>` | Cross-model (Codex) adversarial review of a plan before dispatch |
 | `/v:pr-review [url\|number]` | Two-axis review of a PR, an MR, or a local branch. Never edits code |
 | `/v:adr <decision>` | Record one architecture decision as a thin, human-confirmed ADR |
+| `/v:lessons` | Draft routing lessons from repeated run failures; you accept or reject each one before it is written |
 | `/v:remember "<query>"` | Search the project memory for what this repo already learned |
 | `/v:memory-refresh` | Re-index the memory; `--bootstrap` adds the optional semantic lane |
 | `/v:status [run-id]` | Show a run's phase and per-job table; `--live` watches a running dispatch |

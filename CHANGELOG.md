@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.7.3] - 2026-09-25
+
+### Added — `/v:lessons`: run results draft the lessons, a human decides them
+
+`routing-lessons.md` is the one file the router obeys as human judgement, and in three months it gained no lesson
+beyond its June seed, although 99 runs and 90 dogfood reports piled up. The step "a human spots a pattern and
+writes it down" was never taken, because nothing ever put the pattern in front of a human.
+
+`scripts/compound-v-lessons.py draft` now does the spotting, read-only. It reads every run's results beside its
+manifest and uses V-memory's attributed-failure scan, so only a job's own scope violations and failed test floors
+count: harness faults and `recall_exclude` runs do not. It groups those failures by job type and backend·model, by
+lane area, by the same shared file across runs, and by reviewer escalation. A group needs at least two
+independent runs (the file's own "two or more is a pattern" rule) to become a candidate. Each candidate is written
+in the file's exact format, with its runs cited and its `prefer …` action taken from a fixed menu:
+
+| Signal | Action |
+|---|---|
+| The same file breached across runs | Fold it into Task 0 |
+| Repeated test-floor failures on a light tier | Route one tier up |
+| Repeated escalation | Start reviews at the requested rung |
+| Repeated scope violations | Force worktree or narrow the lane |
+
+A group with no menu entry is reported as unactionable, never drafted.
+
+`/v:lessons` presents the candidates one at a time and checks every cited run exists. It appends to
+`routing-lessons.md` only on an explicit yes, and commits in two separate commands. Each decision is recorded in
+`lesson-reviews.jsonl` so a rejected candidate is not proposed again. The script itself never writes
+`routing-lessons.md`; a selftest checks this both in the source and at run time. `/v:collect` and `/v:dispatch`
+suggest the command after a run with a blocked or failed job.
+
+**On this repository** it finds one candidate. `review` jobs on claude·deep running `direct` were charged by the
+scope gate in 6 runs. Four of those violations are writes other processes made to the shared checkout during the
+run (workflow worktree directories, another run's files, a `.pyc`), which is the case worktree isolation exists
+for. Four of the six runs come from one dogfood session. The candidate is awaiting the maintainer's decision, not
+accepted. Selftests: 52 on Python 3.9 and 3.14; `tests/test-lessons.sh`: 7.
+
 ## [3.7.2] - 2026-09-24
 
 ### Fixed — V-memory: recall that agents actually receive, a failure signal that means something, and honest numbers about the dense lane

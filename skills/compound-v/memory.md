@@ -101,7 +101,9 @@ The same three-part rule in every repository:
    manifest points its `spec_path`/`plan_path` elsewhere (the pointer is read against the repo
    root, whatever the caller's cwd), and **every `*.jsonl` inside a run directory** — append-only
    hook logs. On this repository (2026-09-24) that was 17 `lane-guard-unresolved.jsonl` files,
-   40 chunks of agent ids and timestamps. The durable jsonl in `docs/superpowers/memory/` stays.
+   40 chunks of agent ids and timestamps. The durable jsonl in `docs/superpowers/memory/` stays —
+   including `lesson-reviews.jsonl`, the accepted/rejected log `/v:lessons` appends to, which
+   `source_class_for` maps to `record` like its siblings (only `routing-lessons.md` is `rule`).
    Nothing else under `execution/` is indexed anyway: only `*.md`/`*.jsonl` ever were, so the
    run's `*.json`, `*.baseline`, `*.txt`, `*.patch`, `*.yaml`, `*.js` never entered the index.
 2. **The root docs any project may carry**, when git-tracked: `AGENTS.md`, `CLAUDE.md`,
