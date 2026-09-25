@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [3.7.4] - 2026-09-25
+
+Two ideas taken from popular Claude Code plugins, and two V-memory defects found while building them.
+
+### Added — the recall block is an index, and `show` opens one entry (from claude-mem)
+
+The block injected into pre-flight prompts, review-job prompts and the Trigger-0 hook used to carry 5 hits with
+240-character snippets. It now carries up to 8 rows, each a 120-character teaser and `(~N tok)`: the size of the
+hit's whole section, at 4 characters per token, which is an estimate and not a count. One line says how to read a
+row in full: open the file at that heading, or run the new read-only
+`compound-v-memory.py show <path> --heading "<heading>"`. It looks up by path and heading, never by chunk id,
+because `refresh --rebuild` renumbers ids. Measured on the 23 bench queries (FTS5 only): 5.00 → 7.96 rows per block
+in the same 4 KB cap, and the expected document is inside the block for 12/23 → 13/23 queries. Whether agents
+actually call `show` is not measured. `search --json` gains an additive `chars` key.
+
+### Added — `CV_DISABLED_HOOKS` turns off one hook, not the whole plugin (from ECC)
+
+`CV_DISABLED_HOOKS=triage-prompt-nudge,memory-refresh` takes a comma-separated list of hook script names without
+`.sh`. It covers the 8 reminder, banner and bookkeeping hooks. **`lane-guard` ignores it on purpose.** It is the
+pre-write refusal, and an env var that switches enforcement off could be committed for every clone in a project's
+`settings.json`. The session banner names what is off, flags names that match no hook, and says so when
+`lane-guard` was named. Setting it in the shell that launches Claude Code is tested (`tests/test-disabled-hooks.sh`,
+18 checks); a `settings.json` `env` block should work too, per the Claude Code docs, but is not verified here.
+
+### Fixed — the index could keep a file's old text forever
+
+`refresh` hashed a file after reading and chunking it (after embedding it, in batch mode). An edit that landed in
+between stored the new hash beside the old text, and no later refresh repaired it, because the hashes matched.
+It was found live on four `agents/*.md` files, whose "Step 0" text the index still held in its pre-3.7.2 wording.
+The hash is now taken before the read, so the same race leaves an old hash that the next refresh re-indexes.
+A selftest edits the file mid-index. Rebuild an index built by an earlier version once:
+`compound-v-memory.py refresh --rebuild`.
+
+### Fixed — `missing_paths` was mostly wrong
+
+The "cites a path no longer in the repository" flag (3.7.2) fired 4,535 times across this repo's index, and 3,145
+of those named files that exist. Examples: a bare `` `scope-check.py` ``, `backend-launcher/SKILL.md` written
+relative to `skills/`, `$CV/scripts/…`, a user project's `package.json`. Now a citation is flagged only when it
+has a slash, starts with a real top-level directory, and no tracked file ends with it. That leaves 233 flags, none
+of them on an existing file.
+
 ## [3.7.3] - 2026-09-25
 
 ### Added — `/v:lessons`: run results draft the lessons, a human decides them

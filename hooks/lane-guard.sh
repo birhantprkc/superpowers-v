@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Compound V — PreToolUse lane guard (Feature E, v3.0)
 #
+# This hook deliberately IGNORES CV_DISABLED_HOOKS (unlike the other 8 hooks/*.sh).
+# It is the pre-write refusal that enforces job lanes; an env var that can switch
+# enforcement off — and that a project's committed .claude/settings.json `env` block
+# could set for every clone — would widen an authorization instead of silencing a
+# nudge. session-banner.sh reports `lane-guard` as "ignored (enforcement hook)" if a
+# user names it there.
+#
 # WHAT THIS IS
 # ------------
 # A native `PreToolUse` DENY that refuses a write outside the acting job's

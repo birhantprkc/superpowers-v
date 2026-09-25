@@ -64,6 +64,7 @@ after the explicit `bootstrap` above; the flag never triggers an install.
 |---|---|
 | `refresh [--rebuild] [--quick] [--with-embeddings] [--repo P]` | incremental index by file hash (FTS5 always; dense only when bootstrapped) |
 | `search "<q>" [--top N] [--intent planning\|review] [--json] [--no-embed] [--no-refresh]` | recall: FTS5 (∪ dense) → rank-union → agent-ready context pack. The FTS5 lane is fresh **by construction** at every search — a stale or missing index is refreshed inline before the query runs (`--no-refresh` opts out and searches whatever is already indexed); the dense lane is unaffected and refreshes only on an explicit `/v:memory-refresh --with-embeddings`. |
+| `show <path> [--heading H] [--repo P]` | **read-only**: print ONE whole indexed section by exact `(path, heading)` — never by chunk id, which `refresh --rebuild` renumbers. Sub-split chunks are re-joined with their overlap removed; output capped at 32,000 characters with an explicit truncation note. No `--heading` lists the document's headings with `(~N tok)` sizes; a heading that does not match exactly says so, lists them, and exits 1. Never refreshes, opens the index `mode=ro` (see [Progressive disclosure](#progressive-disclosure-a-recall-index-plus-show)) |
 | `recall-check --files <glob>… [--k N] [--json]` | **deterministic** recurring-failure → `tighten`/`none`/`unavailable` verdict. Files match lane globs with the same matcher as the scope gate: `*` matches within one path segment (never `/`); `**` matches across segments; `dir/**` also matches `dir` itself; `?` matches one non-`/` character; `[` and `]` are literal (no character classes — `app/[locale]/**` is a real directory); matching is anchored to the full repo-relative path (see [`execution-manifest.md`](execution-manifest.md)). recall-check only: a bare path with no wildcard means "this path or anything under it" (the enforced gate has no such reading). Proof: the `parity …` rows of `python3 "$CV/scripts/compound-v-memory.py" --selftest`. |
 | `bootstrap [--model M]` | the ONLY network step: create the out-of-repo embedding venv |
 | `doctor` | index / corpus / tokenizer / staleness health, SQLite FTS5 availability, and ONE `mode:` line naming the lanes a search actually uses (see [Doctor modes](#doctor-modes)) |
@@ -79,9 +80,11 @@ window, not just from this doc. Every hit's heading is tagged with its [source c
 (`[rule]`, `[record]`, `[reference]`, `[research]`, or `[plan]`) and, when it cites a repo path
 that is not there any more, an appended `(cites N path(s) no longer in the tree: …)` note.
 `search --json` is additive only: the pre-3.7.3 five keys (`path`, `heading`, `doc_type`, `date`,
-`snippet`) are unchanged, plus new `source` and `missing_paths` keys — a caller that reads by key
-name, not position, is unaffected; `grep -rn '"search".*--json\|context_pack('` before adding a
-sixth.
+`snippet`) are unchanged, plus `source`, `missing_paths` and `chars` (the length of the hit's
+whole `(path, heading)` section — what `show` would print) — a caller that reads by key
+name, not position, is unaffected; `grep -rn '"search".*--json\|context_pack('` before adding
+another. The text pack adds `(~N tok)` to each hit's heading line and ends with one line naming
+`show`.
 
 A search-triggered refresh is FTS5-only: it never applies the `--quick` cap and never consults
 the embeddings config, so it always catches up fully regardless of how many files are stale.
@@ -187,8 +190,14 @@ already-built index:
   with the same private-bytecode-cache hardening as the scope-gate matcher below it. A
   citation the resolver refuses on every candidate (a real `..` escape, an absolute path, an
   out-of-repo symlink target) is not a resolvable claim about this repo and is silently
-  skipped; a citation the resolver accepts but that does not exist at HEAD is flagged, never
-  dropped: the text pack appends `(cites N path(s) no longer in the tree: a, b)` to that hit,
+  skipped. A citation that survives both joins is flagged only when it reads as a path INTO
+  this repo (3.7.4): it has a slash, its first segment is a real top-level directory, and no
+  git-tracked file ends with it. Without that rule, measured on this repo's index 2026-09-25,
+  3,145 of 4,535 flags named files that exist — a bare `` `scope-check.py` `` for a file
+  elsewhere in the tree, `backend-launcher/SKILL.md` written relative to `skills/`,
+  `$CV/scripts/x.py`, a user project's `package.json`. With it: 233 flags, none on an
+  existing file; what remains is removed files plus example paths inside specs. Such a
+  citation, not existing at HEAD, is flagged, never dropped: the text pack appends `(cites N path(s) no longer in the tree: a, b)` to that hit,
   and `search --json` adds a `"missing_paths"` key (additive). Degrade-safe: if the resolver
   cannot be loaded at all, every hit's `missing_paths` is `[]` — a broken citation checker
   never blocks or fails a search.
@@ -265,6 +274,38 @@ to test against, and a fixture's pass/fail must never depend on this project's o
 changing under it.
 
 ---
+
+## Progressive disclosure: a recall index plus `show`
+
+The block the emitters inject (`## Prior context from this repository (V-memory)` — pre-flight
+prompts, review-job prompts, and the Trigger-0 hook) is an **index**, not an excerpt: up to 8
+rows, each a 120-character quoted teaser followed by `(~N tok)`, the size of that hit's whole
+section. `N` is characters ÷ 4 — a heuristic, never a measured token count. One line under the
+framing sentence says how to expand a row: open that file at that heading, or run the engine's
+`show <path> --heading "<heading>"` (with `--repo` when the emit knows the repository, so a
+reviewer in a worktree reads the right index). The heading, framing sentence, end marker,
+4,096-byte cap, quoting and one-line collapsing are unchanged. The Trigger-0 hook still asks for
+3 rows.
+
+Two limits of the size and of `show`: a `.jsonl` file's records all share an empty heading, so
+its "section" is the whole file; two sections of one document with the same heading are one key
+(the same key recall deduplicates on) and are printed together.
+
+**Measured 2026-09-25, this repo, the 23 rows of `tests/memory-queries.tsv`, FTS5 only
+(`--no-embed --no-refresh`)**, each query run through `compound-v-emit-preflight.py`'s own
+search-and-render path, old renderer taken from the previous commit:
+
+| renderer | rows per block (avg) | block bytes (avg / max) | expected doc inside the block |
+|---|---|---|---|
+| before: top 5, 240-char snippet | 5.00 | 2,375 / 3,213 | 12/23 |
+| after: top 8, 120-char teaser + size | 7.96 | 3,167 / 3,976 | 13/23 |
+| tried: top 10, 120-char teaser | 9.57 | 3,660 / 4,074 | 13/23 |
+
+The old block never reached the 4 KB cap — it was bounded by its row count. At 8 rows one query
+of the 23 drops a row to fit; at 10 rows the cap starts cutting rows and the expected-doc count
+does not move, so 8 it is. The one gained query is a `ru-translated` row whose answer ranks 6th.
+Not measured: whether agents actually call `show`, and whether the shorter teaser changes what
+they conclude — this table says the index holds more candidates in the same budget, nothing more.
 
 ## Recall stays subordinate (the precedence rule)
 

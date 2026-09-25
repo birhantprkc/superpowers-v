@@ -865,10 +865,15 @@ def release_lock(fd):
 # --------------------------------------------------------------------------- #
 # refresh / indexing
 # --------------------------------------------------------------------------- #
-def _persist_chunks(conn, root, rel, chunks, vecs):
+def _persist_chunks(conn, root, rel, chunks, vecs, sha=None):
     """Atomically replace one file's chunks (+ optional embeddings) and update indexed_files;
     triggers the sync FTS. A None/short `vecs` (or a None element) degrades that chunk to a NULL
-    embedding — never crashes. Returns the chunk count."""
+    embedding — never crashes. Returns the chunk count.
+
+    `sha` must be hashed BEFORE the file was read for `chunks`: hashed after, an edit
+    landing in between stores new-hash + old-text, and no later refresh ever repairs it
+    (found live 2026-09-25 on four agents/*.md). Hashed before, the race leaves an old
+    hash, which the next refresh sees as changed and re-indexes."""
     abspath = os.path.join(root, rel)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -886,7 +891,7 @@ def _persist_chunks(conn, root, rel, chunks, vecs):
             "INSERT INTO indexed_files(path,content_hash,indexed_at) VALUES(?,?,?) "
             "ON CONFLICT(path) DO UPDATE SET content_hash=excluded.content_hash, "
             "indexed_at=excluded.indexed_at",
-            (rel, file_sha(abspath), _now()),
+            (rel, sha if sha is not None else file_sha(abspath), _now()),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -900,11 +905,12 @@ def reindex_file(conn, root, rel, embedder):
     OFF (FTS5-only) and as a fallback. When many files are embedded at once, cmd_refresh uses
     reindex_batch so the isolated-venv embedder loads the model ONCE, not once per file."""
     abspath = os.path.join(root, rel)
+    sha = file_sha(abspath)
     chunks = chunk_file(abspath, rel)
     vecs = None
     if embedder is not None and chunks:
         vecs = embedder([c["text"] for c in chunks])
-    return _persist_chunks(conn, root, rel, chunks, vecs)
+    return _persist_chunks(conn, root, rel, chunks, vecs, sha=sha)
 
 
 # Max chunks per embedder subprocess call. One flat call over a large corpus blows the embedder's
@@ -932,15 +938,18 @@ def reindex_batch(conn, root, rels, embedder):
     corpus never trips the embedder's per-call timeout. Chunks are flattened in order, embedded,
     then the vectors are sliced back per file. Degrade-safe: a None result (embed failed) persists
     every file with NULL embeddings (FTS5-only). Returns the number of files processed."""
-    per_file = [(rel, chunk_file(os.path.join(root, rel), rel)) for rel in rels]
-    flat = [c["text"] for _, chunks in per_file for c in chunks]
+    per_file = []
+    for rel in rels:
+        sha = file_sha(os.path.join(root, rel))
+        per_file.append((rel, sha, chunk_file(os.path.join(root, rel), rel)))
+    flat = [c["text"] for _, _, chunks in per_file for c in chunks]
     all_vecs = _embed_batched(embedder, flat) if (embedder is not None and flat) else None
     offset = 0
-    for rel, chunks in per_file:
+    for rel, sha, chunks in per_file:
         n = len(chunks)
         vecs = all_vecs[offset:offset + n] if all_vecs is not None else None
         offset += n
-        _persist_chunks(conn, root, rel, chunks, vecs)
+        _persist_chunks(conn, root, rel, chunks, vecs, sha=sha)
     return len(per_file)
 
 
@@ -1249,12 +1258,17 @@ def context_pack(results, q, as_json, mode=""):
     if as_json:
         # Additive only: every pre-3.7.3 key stays, in the same place — callers that index by
         # key (not position) are unaffected. `grep -rn '"search".*--json\|context_pack(' for
-        # every caller of this JSON shape before adding a fourth key.
+        # every caller of this JSON shape before adding a key (`chars` was checked against
+        # both emitters' `normalize_hits`, which read keys by name).
         return json.dumps([
             {"path": r["path"], "heading": r["heading"], "doc_type": r["doc_type"],
              "date": r["date"], "snippet": (r["text"] or "")[:280],
              "source": r.get("source", "reference"),
-             "missing_paths": r.get("missing_paths") or []} for r in results
+             "missing_paths": r.get("missing_paths") or [],
+             # `chars`: length of the hit's WHOLE (path, heading) section, overlap removed —
+             # what `show` would print. Absent only for a result no conn ever measured.
+             **({"chars": r["chars"]} if isinstance(r.get("chars"), int) else {})}
+            for r in results
         ], ensure_ascii=False, indent=2)
     out = ["# V-memory recall", "", "Query: %s" % q]
     if mode:
@@ -1268,13 +1282,18 @@ def context_pack(results, q, as_json, mode=""):
     for i, r in enumerate(results, 1):
         tag = "[%s] " % r.get("source", "reference")
         loc = r["path"] + (" — " + r["heading"] if r["heading"] else "")
-        out.append("\n### %d. %s%s" % (i, tag, loc))
+        size = " (~%d tok)" % (r["chars"] // 4) if isinstance(r.get("chars"), int) else ""
+        out.append("\n### %d. %s%s%s" % (i, tag, loc, size))
         snip = " ".join((r["text"] or "").split())[:280]
         out.append(snip)
         missing = r.get("missing_paths") or []
         if missing:
             out.append("(cites %d path(s) no longer in the tree: %s)"
                        % (len(missing), ", ".join(missing)))
+    out.append("")
+    # the absolute engine path: `scripts/…` does not exist in a downstream repository
+    out.append("Expand one section: python3 \"%s\" show <path> --heading \"<heading>\" "
+               "(sizes are ~4 characters per token, an estimate)." % os.path.abspath(__file__))
     return "\n".join(out)
 
 
@@ -1421,9 +1440,37 @@ def stale_citations(text: str, root: str, doc_relpath: str = ""):
             if os.path.exists(abspath):
                 found = True
                 break
-        if accepted_any and not found:
+        if accepted_any and not found and _plausible_repo_claim(p, root):
             missing.append(p)
     return missing
+
+
+_TRACKED_CACHE = {}
+
+
+def _plausible_repo_claim(p: str, root: str) -> bool:
+    """Only a citation that reads as a path INTO this repo may be flagged missing. Measured on
+    this repo's index (2026-09-25): 4,535 flags, 3,145 of them naming files that exist — a bare
+    `` `scope-check.py` `` meaning a file elsewhere in the tree, `backend-launcher/SKILL.md`
+    written relative to `skills/`, `$CV/scripts/x.py`, and example files of a user's project
+    (`package.json`, `Cargo.toml`). So a citation counts only when it has a slash, its first
+    segment is a real top-level directory here, and no tracked file ends with it."""
+    if "/" not in p:
+        return False
+    first = p.split("/", 1)[0]
+    if not first or first in (".", "..") or not os.path.isdir(os.path.join(root, first)):
+        return False
+    tracked = _TRACKED_CACHE.get(root)
+    if tracked is None:
+        try:
+            r = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True,
+                               timeout=10)
+            tracked = [t for t in r.stdout.decode("utf-8", "replace").split("\0") if t] \
+                if r.returncode == 0 else []
+        except Exception:  # noqa: BLE001 — degrade-safe: no list, no suffix rescue
+            tracked = []
+        _TRACKED_CACHE[root] = tracked
+    return not any(t == p or t.endswith("/" + p) for t in tracked)
 
 
 def index_staleness(conn, root):
@@ -1523,6 +1570,7 @@ def _run_one_search(conn, paths, query, top, no_embed, root):
     for r in results:
         r["source"] = source_class_for(r["path"], r["doc_type"])
         r["missing_paths"] = stale_citations(r.get("text") or "", root, r["path"])
+        r["chars"] = len(section_text(conn, r["path"], r.get("heading") or ""))
     return results, mode
 
 
@@ -1538,6 +1586,76 @@ def cmd_search(args) -> int:
     results, mode = _run_one_search(conn, paths, args.query, args.top, args.no_embed, root)
     print(context_pack(results, args.query, args.json, mode=mode))
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# show — progressive disclosure: fetch ONE whole section a recall row only teased.
+# Keyed by (path, heading), never by chunk id: ids are renumbered by `refresh --rebuild`,
+# so an id quoted in an injected prompt would go stale. Read-only: never refreshes, never
+# creates or migrates the index (the db is opened `mode=ro`).
+# --------------------------------------------------------------------------- #
+SHOW_MAX_CHARS = 32000
+
+
+def _join_overlap(texts):
+    """Re-join a section's sub-split chunks. `_split_long` overlaps consecutive pieces by
+    CHUNK_OVERLAP_CHARS (then strips each), so the longest suffix of the text so far that
+    is a prefix of the next piece is dropped once. Pieces that do not overlap (two
+    sections sharing one heading) are joined with a blank line."""
+    out = ""
+    for t in texts:
+        t = t or ""
+        if not out:
+            out = t
+            continue
+        k = min(len(out), len(t), CHUNK_OVERLAP_CHARS)
+        while k > 0 and not out.endswith(t[:k]):
+            k -= 1
+        out = out + t[k:] if k else out + "\n\n" + t
+    return out
+
+
+def section_text(conn, path, heading):
+    """The whole (path, heading) section, overlap removed; "" when nothing matches.
+    Two sections of one file that share a heading are both returned (the same key
+    `rank_union` deduplicates hits on)."""
+    rows = conn.execute("SELECT text FROM chunks WHERE path=? AND COALESCE(heading,'')=? "
+                        "ORDER BY chunk_index", (path, heading or "")).fetchall()
+    return _join_overlap([r[0] for r in rows])
+
+
+def cmd_show(args) -> int:
+    root = find_repo_root(args.repo or os.getcwd())
+    db = cache_paths(root)["db"]
+    if not os.path.exists(db):
+        print("V-memory index not found. Run: python3 scripts/compound-v-memory.py refresh")
+        return 1
+    conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        if args.heading is not None:
+            text = section_text(conn, args.path, args.heading)
+            if text:
+                if len(text) > SHOW_MAX_CHARS:
+                    text = text[:SHOW_MAX_CHARS] + (
+                        "\n\n[truncated: showed %d of %d characters — read %s directly for "
+                        "the rest]" % (SHOW_MAX_CHARS, len(text), args.path))
+                print(text)
+                return 0
+            print("No exact match for heading %r in %s." % (args.heading, args.path))
+        heads = conn.execute("SELECT COALESCE(heading,''), MIN(chunk_index) FROM chunks "
+                             "WHERE path=? GROUP BY COALESCE(heading,'') ORDER BY 2",
+                             (args.path,)).fetchall()
+        if not heads:
+            print("No indexed document at %r (use the repo-relative path a recall hit "
+                  "names)." % args.path)
+            return 1
+        print("Sections of %s (use: show %s --heading \"<heading>\"):" % (args.path, args.path))
+        for h, _ in heads:
+            n = len(section_text(conn, args.path, h))
+            print("  (~%d tok) %s" % (n // 4, h or "(no heading)"))
+        return 1 if args.heading is not None else 0
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -2073,6 +2191,31 @@ def _selftest() -> int:
         res2 = bm25_search(conn, "who is the default planner", 10)
         check("search semantic-ish lexical hit", any("memory.md" in r["path"] for r in res2))
         check("search punct-only empty", bm25_search(conn, "%%%", 10) == [])
+
+        # hash-before-read: an edit landing between the hash and the read must leave the
+        # stored hash STALE (so the next refresh re-indexes), never new-hash + old-text.
+        _race_rel = DOCS_REL + "/memory.md"
+        _race_abs = os.path.join(tmp, _race_rel)
+        _orig_chunk_file = globals()["chunk_file"]
+
+        def _racing_chunk_file(abspath, rel):
+            out = _orig_chunk_file(abspath, rel)
+            with open(abspath, "a") as fh:
+                fh.write("\nedited mid-index\n")
+            return out
+        globals()["chunk_file"] = _racing_chunk_file
+        try:
+            reindex_file(conn, tmp, _race_rel, None)
+        finally:
+            globals()["chunk_file"] = _orig_chunk_file
+        _stored = conn.execute("SELECT content_hash FROM indexed_files WHERE path=?",
+                               (_race_rel,)).fetchone()[0]
+        check("reindex hashes before reading (mid-index edit stays visible as stale)",
+              _stored != file_sha(_race_abs))
+        reindex_file(conn, tmp, _race_rel, None)
+        check("reindex after the race stores the current hash",
+              conn.execute("SELECT content_hash FROM indexed_files WHERE path=?",
+                           (_race_rel,)).fetchone()[0] == file_sha(_race_abs))
 
         # incremental: unchanged -> 0 reindex; change one -> reindex; remove -> purge
         class A2:
@@ -2848,6 +2991,17 @@ def _selftest() -> int:
               stale_citations("see `docs/sub/existing.md`", _cd) == [])
         check("stale_citations: a genuinely absent path IS flagged",
               stale_citations("see `docs/sub/gone.md`", _cd) == ["docs/sub/gone.md"])
+        check("stale_citations: a bare filename is never flagged (it may live anywhere)",
+              stale_citations("see `gone.md` and `package.json`", _cd) == [])
+        check("stale_citations: a first segment that is no top-level dir is not a repo claim",
+              stale_citations("see `CV/scripts/x.py` and `google/design.md`", _cd) == [])
+        _TRACKED_CACHE[_cd] = ["docs/sub/existing.md", "skills/backend-launcher/SKILL.md"]
+        os.makedirs(os.path.join(_cd, "skills"), exist_ok=True)
+        check("stale_citations: a path that is the tail of a tracked file is not missing",
+              stale_citations("see `sub/existing.md`", _cd) == []
+              and stale_citations("see `backend-launcher/SKILL.md`", _cd,
+                                  doc_relpath="skills/compound-v/x.md") == [])
+        _TRACKED_CACHE.pop(_cd, None)
         check("stale_citations: a bare same-directory filename resolves doc-relative "
               "(routing-lessons.md-style cross-reference), not root-relative",
               stale_citations("see `existing.md`", _cd, doc_relpath="docs/sub/here.md") == [])
@@ -2896,6 +3050,86 @@ def _selftest() -> int:
           "(every pre-3.7.3 selftest fixture) — defaults are reference / no missing paths",
           "[reference] a.md" in context_pack([_it(1, "a.md", "H")], "q", False, mode=""))
 
+    # ===================================================================== #
+    # progressive disclosure — `chars` per hit + a read-only `show` by (path, heading)
+    # ===================================================================== #
+    check("_join_overlap: overlapping sub-split pieces re-join exactly once",
+          _join_overlap(["abcdef", "defghi"]) == "abcdefghi"
+          and _join_overlap(["abc", "xyz"]) == "abc\n\nxyz" and _join_overlap([]) == "")
+    _sh = tempfile.mkdtemp()
+    try:
+        os.environ["COMPOUND_V_MEMORY_HOME"] = os.path.join(_sh, "cache")
+        os.makedirs(os.path.join(_sh, DOCS_REL, "specs"))
+        _long_body = "\n".join("line %04d of the long gate section" % i for i in range(300))
+        _huge_body = "\n".join("row %05d " % i + "y" * 60 for i in range(600))
+        with open(os.path.join(_sh, DOCS_REL, "specs", "2026-09-01-s.md"), "w") as fh:
+            fh.write("# Top\nintro\n## Long gate\n" + _long_body + "\n## Huge\n" + _huge_body + "\n")
+
+        class _SA:
+            repo = _sh; rebuild = False; quick = False; with_embeddings = False
+            path = "docs/superpowers/specs/2026-09-01-s.md"; heading = None
+        import contextlib as _cl6
+        import io as _io6
+
+        def _show(**kw):
+            a = _SA()
+            for k, v in kw.items():
+                setattr(a, k, v)
+            o = _io6.StringIO()
+            with _cl6.redirect_stdout(o):
+                rc = cmd_show(a)
+            return rc, o.getvalue()
+        _rc0, _o0 = _show(heading="Long gate")
+        check("show: missing index -> rc 1 and the refresh hint, nothing created",
+              _rc0 == 1 and "index not found" in _o0
+              and not os.path.exists(cache_paths(_sh)["db"]))
+        with _cl6.redirect_stdout(_io6.StringIO()):
+            cmd_refresh(_SA())
+        _db = cache_paths(_sh)["db"]
+        _mt = os.path.getmtime(_db)
+        _rc1, _o1 = _show(heading="Long gate")
+        check("show: an exact (path, heading) match prints the whole section, sub-split "
+              "overlap removed (byte-equal to the source section)",
+              _rc1 == 0 and _o1 == "## Long gate\n" + _long_body + "\n")
+        _rc2, _o2 = _show(heading="Long")
+        check("show: no exact heading match -> rc 1, says so, lists the doc's headings",
+              _rc2 == 1 and "No exact match" in _o2 and "Long gate" in _o2 and "(~" in _o2)
+        _rc3, _o3 = _show()
+        check("show: no --heading -> rc 0, one line per heading with a ~token size",
+              _rc3 == 0 and _o3.count("(~") == 3 and "Top" in _o3 and "Huge" in _o3)
+        _rc4, _o4 = _show(heading="Huge")
+        check("show: a section over SHOW_MAX_CHARS is capped with an explicit truncation note",
+              _rc4 == 0 and "[truncated: showed %d of" % SHOW_MAX_CHARS in _o4
+              and len(_o4) < SHOW_MAX_CHARS + 300)
+        _rc5, _o5 = _show(path="docs/superpowers/specs/nope.md", heading="X")
+        check("show: an unindexed path -> rc 1 with a clear message",
+              _rc5 == 1 and "No indexed document" in _o5)
+        check("show: read-only — the index file is never written",
+              os.path.getmtime(_db) == _mt)
+
+        class _QA:
+            repo = _sh; query = "long gate section"; top = 3; json = True
+            no_embed = True; no_refresh = True; intent = None
+        _oq = _io6.StringIO()
+        with _cl6.redirect_stdout(_oq):
+            cmd_search(_QA())
+        _jq = json.loads(_oq.getvalue())
+        check("search --json: `chars` is the whole section's length (additive key)",
+              _jq and _jq[0]["heading"] == "Long gate"
+              and _jq[0]["chars"] == len("## Long gate\n" + _long_body)
+              and all(k in _jq[0] for k in ("path", "heading", "doc_type", "date", "snippet",
+                                             "source", "missing_paths")))
+        _QA.json = False
+        _ot = _io6.StringIO()
+        with _cl6.redirect_stdout(_ot):
+            cmd_search(_QA())
+        check("search text: `(~N tok)` per hit and one expand line naming `show`",
+              "(~%d tok)" % (len("## Long gate\n" + _long_body) // 4) in _ot.getvalue()
+              and _ot.getvalue().count("show <path> --heading") == 1)
+    finally:
+        os.environ.pop("COMPOUND_V_MEMORY_HOME", None)
+        shutil.rmtree(_sh, ignore_errors=True)
+
     print("\n%d failed" % len(fails))
     if fails:
         print("FAILED: " + ", ".join(fails))
@@ -2931,6 +3165,12 @@ def build_parser():
     sp.add_argument("--no-refresh", dest="no_refresh", action="store_true",
                      help="read exactly what is indexed; never refresh the FTS5 lane inline")
 
+    sp = sub.add_parser("show", help="read-only: print one indexed section by (path, heading)")
+    add_repo(sp)
+    sp.add_argument("path", help="repo-relative path exactly as a recall hit names it")
+    sp.add_argument("--heading", default=None,
+                    help="exact heading; omit to list the document's headings with sizes")
+
     sp = sub.add_parser("recall-check", help="deterministic recurring-failure -> tighten verdict")
     add_repo(sp)
     sp.add_argument("--files", nargs="+", required=True, help="file globs of the current diff")
@@ -2963,7 +3203,7 @@ def main(argv) -> int:
         build_parser().print_help()
         return 1
     return {
-        "refresh": cmd_refresh, "search": cmd_search, "recall-check": cmd_recall_check,
+        "refresh": cmd_refresh, "search": cmd_search, "show": cmd_show, "recall-check": cmd_recall_check,
         "bootstrap": cmd_bootstrap, "doctor": cmd_doctor, "bench": cmd_bench,
     }[args.cmd](args)
 

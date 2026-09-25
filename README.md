@@ -108,6 +108,7 @@ The triage gate is on by default. It is exempt on `docs/superpowers/**`, fires a
 - **Research-grounded brainstorming is guidance, not a mechanism** 🧪 — the skill asks an unfamiliar-topic brainstorm to run a gated recon pass first and to batch independent
   questions into one screen. A hook only reminds; nothing enforces either, and the recon doc is evidence, never a routing input.
 - **Agent memory is off-switchable** — `{"autoMemoryEnabled": false}` turns it off everywhere. `implementer` and `parallel-dispatcher` carry none: a memory write would leave their lane.
+- **A noisy hook is off-switchable too** — `CV_DISABLED_HOOKS=<name>,<name>` (comma-separated basenames, no `.sh`, spaces ignored) turns off individual reminder/nudge hooks, e.g. `CV_DISABLED_HOOKS=triage-prompt-nudge,memory-refresh`. `lane-guard` is exempt — see TROUBLESHOOTING.md.
 - **Marathon mode is still not fire-and-forget.** It drops the checkpoint and adds an arbiter panel, a blocker ledger and breakers, but after a hard death you re-run `/v:epic <epic-id>` yourself.
 
 ## Verification program

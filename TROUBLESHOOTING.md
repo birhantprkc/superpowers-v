@@ -271,6 +271,14 @@ render it — read it from `state.json` or the ack.
 
 Two honest limits: on Claude Code 2.1.238 an agent is **not told its own `agent_id`**, so the `agents` map is normally empty and resolution runs on the `worktrees` map — which is the fallback the 1D probe proved works. And the guard is **defence in depth, never the authority**: shell writes have unbounded evasions (`eval`, an interpreter one-liner, a variable holding the path), and the git-derived scope gate plus the integration postcondition still decide what enters the tree.
 
+## A Compound V hook is noisy
+
+**Symptom:** one particular hook (a nudge, a banner line, the triage record) keeps firing and you want it off without disabling the whole plugin.
+
+**Fix:** set `CV_DISABLED_HOOKS` to a comma-separated list of hook basenames (no `.sh`; spaces around names are ignored), e.g. `CV_DISABLED_HOOKS=triage-prompt-nudge,memory-refresh`. It covers the 8 reminder/nudge/banner hooks in `hooks/` — not `lane-guard`, which deliberately ignores it (it is the pre-write enforcement gate; an env var that can switch it off, including one set for every clone via a committed `.claude/settings.json` `env` block, would widen an authorization). Naming `lane-guard` there is reported by the session banner as "ignored (enforcement hook)" and changes nothing.
+
+Set it in the shell that launches Claude Code — verified by `tests/test-disabled-hooks.sh`. Per the Claude Code docs it can also go in `settings.json`'s `env` block and takes effect after a restart, but that path is **not verified here**.
+
 ## There is a line in `lane-guard-unresolved.jsonl`
 
 **Symptom:** `docs/superpowers/execution/<run-id>/lane-guard-unresolved.jsonl` has one or more JSON lines, and the session that produced
